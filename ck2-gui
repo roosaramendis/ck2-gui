@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Launcher for the CorridorKey 2.0 GUI (Linux + macOS). uv creates and caches
+# a small environment with PySide6 the first time; later starts are instant.
+here="$(cd "$(dirname "$0")" && pwd -P)"
+# Apps started from Finder/Dock/KDE menu may not have these on PATH.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+if ! command -v uv >/dev/null 2>&1; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+        msg="uv is not installed. In Terminal run:  brew install uv ffmpeg git"
+        osascript -e "display alert \"CorridorKey 2.0\" message \"$msg\"" >/dev/null 2>&1
+    else
+        msg="uv is not installed. Run:  sudo pacman -S --needed uv git ffmpeg"
+        command -v notify-send >/dev/null && notify-send "CorridorKey 2.0" "$msg"
+    fi
+    echo "$msg" >&2
+    exit 1
+fi
+exec uv run --quiet --script "$here/ck2_gui.py" "$@"
