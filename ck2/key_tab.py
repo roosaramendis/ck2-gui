@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QProgressBar,
@@ -389,6 +390,7 @@ class KeyTab(QWidget):
         run.addWidget(self.status)
         bl.addLayout(run)
         self.log = LogView()
+        self.log.persist("key")
         bl.addWidget(self.log, 1)
 
         vsplit = QSplitter(Qt.Orientation.Vertical)
@@ -886,6 +888,7 @@ class KeyTab(QWidget):
         self.status.setText(msg)
         self.log.line(msg)
         notify("CorridorKey 2.0", msg)
+        QApplication.alert(self.window())  # taskbar flash / dock bounce if the window is in the back
         j = self._sel()
         if j:
             self._update_preview(j, prefer="Output: alpha")

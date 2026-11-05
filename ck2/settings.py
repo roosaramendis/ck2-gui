@@ -1,21 +1,28 @@
 """Persistent settings (~/.config/ck2-gui/ck2-gui.conf on Linux,
-~/Library/Preferences/com.ck2-gui.ck2-gui.plist on macOS)."""
+~/Library/Preferences/com.ck2-gui.ck2-gui.plist on macOS, the registry under
+HKCU\\Software\\ck2-gui on Windows)."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from PySide6.QtCore import QSettings
 
 from . import jobs
-from .plat import BACKEND, IS_MAC
+from .plat import BACKEND, IS_MAC, IS_WIN
 
 if BACKEND == "mlx":
     DEFAULT_ENGINE = Path.home() / "apps" / "CorridorKey-MLX"
+elif IS_WIN:
+    # Short path: Windows has a 260-character limit some PyTorch files get close to.
+    DEFAULT_ENGINE = Path.home() / "ck2" / "CorridorKey2.0"
 else:
     DEFAULT_ENGINE = Path.home() / "apps" / "CorridorKey2.0"
 
 if IS_MAC:
     DEFAULT_TEMP = Path.home() / "Library" / "Caches" / "corridorkey-tmp"
+elif IS_WIN:
+    DEFAULT_TEMP = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ck2-gui" / "tmp"
 else:
     # Not /tmp: on CachyOS /tmp is RAM-backed tmpfs, and low-VRAM mode writes
     # multi-GB feature caches there.

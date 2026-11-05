@@ -8,12 +8,16 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import sys
+
 from PySide6.QtCore import QProcess
 
-APP_ROOT = Path(__file__).resolve().parents[1]
-IS_MAC = platform.system() == "Darwin"
+from . import tools
+from .tools import FROZEN, IS_LINUX, IS_MAC, IS_WIN
 
-# "cuda" = official CorridorKey2.0 engine on NVIDIA (Linux)
+APP_ROOT = tools.resource_root()
+
+# "cuda" = official CorridorKey2.0 engine on NVIDIA (Linux, Windows)
 # "mps"  = official CorridorKey2.0 engine on the Apple GPU via apple_gpu.py
 #          (any resolution; the default on Macs)
 # "mlx"  = community MLX port (Apple Silicon; faster, ≈1280×720 / 1536×1024 only)
@@ -34,14 +38,7 @@ APPLE_GPU_WRAPPER = APP_ROOT / "ck2" / "apple_gpu.py"
 
 
 def fix_path():
-    """Apps started from Finder/Dock get a minimal PATH without Homebrew."""
-    extra = ["/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".local/bin"),
-             str(Path.home() / ".cargo/bin")]
-    parts = os.environ.get("PATH", "").split(os.pathsep)
-    for p in reversed(extra):
-        if p not in parts and Path(p).is_dir():
-            parts.insert(0, p)
-    os.environ["PATH"] = os.pathsep.join(parts)
+    tools.fix_path()
 
 
 def apple_silicon() -> bool:
@@ -72,18 +69,39 @@ def notify(title: str, msg: str):
         safe = msg.replace('"', "'")
         QProcess.startDetached("osascript", [
             "-e", f'display notification "{safe}" with title "{title}"'])
+    elif IS_WIN:
+        return  # the window flashes in the taskbar instead (see key_tab)
     elif shutil.which("notify-send"):
         QProcess.startDetached("notify-send", ["-a", title, "-i", "video-display", title, msg])
 
 
 def open_path_cmd() -> str:
-    return "open" if IS_MAC else "xdg-open"
+    return "open" if IS_MAC else "explorer" if IS_WIN else "xdg-open"
+
+
+def app_command() -> str:
+    """How to start this app from a menu entry / shortcut."""
+    if os.environ.get("APPIMAGE"):
+        return os.environ["APPIMAGE"]
+    if FROZEN:
+        return sys.executable
+    return str(APP_ROOT / ("ck2-gui.bat" if IS_WIN else "ck2-gui"))
 
 
 def install_launcher() -> str:
     """Create a KDE menu entry (Linux) or an app in ~/Applications (macOS).
     Returns a message for the log."""
-    launcher = APP_ROOT / "ck2-gui"
+    launcher = app_command()
+    if IS_WIN:
+        lnk = Path(os.environ.get("APPDATA", Path.home())) / "Microsoft/Windows/Start Menu/Programs/CorridorKey 2.0.lnk"
+        ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}');"
+              f"$s.TargetPath='{launcher}';$s.WorkingDirectory='{Path(launcher).parent}';$s.Save()")
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True)
+        if r.returncode != 0:
+            return f"[error] couldn't create the shortcut: {r.stderr.strip()}"
+        return f"Created {lnk}. It shows up in the Start menu as \"CorridorKey 2.0\"."
+    if IS_MAC and FROZEN:
+        return "The app is already an application: drag it to Applications if it isn't there."
     if IS_MAC:
         app = Path.home() / "Applications" / "CorridorKey 2.0.app"
         macos = app / "Contents" / "MacOS"
@@ -107,8 +125,13 @@ def install_launcher() -> str:
             f'exec "{launcher}" "$@"\n')
         exe.chmod(0o755)
         return f"Created {app}. Open it from Launchpad/Spotlight as \"CorridorKey 2.0\"."
-    apps = Path.home() / ".local/share/applications"
+    data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    apps = data / "applications"
     apps.mkdir(parents=True, exist_ok=True)
+    icon = data / "icons" / "ck2-gui.svg"  # copy: an AppImage's own files vanish when it exits
+    icon.parent.mkdir(parents=True, exist_ok=True)
+    if (APP_ROOT / "ck2-gui.svg").exists():
+        shutil.copy2(APP_ROOT / "ck2-gui.svg", icon)
     f = apps / "ck2-gui.desktop"
     f.write_text(
         "[Desktop Entry]\n"
@@ -116,10 +139,10 @@ def install_launcher() -> str:
         "Name=CorridorKey 2.0\n"
         "GenericName=AI Green Screen Keyer\n"
         "Comment=Key green/blue screen footage with CorridorKey 2.0\n"
-        f"Exec={launcher} %F\n"
-        f"Icon={APP_ROOT / 'ck2-gui.svg'}\n"
+        f"Exec=\"{launcher}\" %F\n"
+        f"Icon={icon}\n"
         "Terminal=false\n"
         "Categories=AudioVideo;Video;Graphics;\n"
         "MimeType=video/mp4;video/quicktime;video/x-matroska;video/webm;inode/directory;\n"
         "StartupWMClass=ck2-gui\n")
-    return f"Created {f}. It shows up in the KDE app menu as \"CorridorKey 2.0\"."
+    return f"Created {f}. It shows up in your app menu as \"CorridorKey 2.0\"."

@@ -2,7 +2,7 @@
 
 Pure Python (no Qt) so it can be tested on its own. Two engines:
 
-  cuda: official nikopueringer/CorridorKey2.0 (Linux + NVIDIA), infer.py
+  cuda: official nikopueringer/CorridorKey2.0 (Linux/Windows + NVIDIA), infer.py
   mlx:  community peterteravskis/corridorkey-v2-mlx (Apple Silicon)
 
 The hint-matching rules mirror CorridorKey 2.0's run_interactive.py:
@@ -57,7 +57,8 @@ ALL_OUTPUTS = ["alpha", "fg", "checker", "cutout"]
 # ---------------------------------------------------------------- engine state
 
 def venv_python(engine: Path) -> Path:
-    return engine / "venv" / "bin" / "python"
+    from .tools import venv_python as vp  # venv\Scripts\python.exe on Windows
+    return vp(engine)
 
 
 def missing_weights(engine: Path) -> list[str]:

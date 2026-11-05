@@ -37,6 +37,26 @@ class LogView(QPlainTextEdit):
         font.setStyleHint(QFont.StyleHint.Monospace)
         self.setFont(font)
         self._cur = ""
+        self._file = None
+
+    def persist(self, name: str):
+        """Also append everything to <app data>/logs/<name>.log (for bug reports)."""
+        from . import tools
+        path = tools.log_dir() / f"{name}.log"
+        try:
+            if path.exists() and path.stat().st_size > 2 * 2**20:
+                path.replace(path.with_suffix(".old.log"))
+            self._file = open(path, "a", encoding="utf-8", errors="replace")
+        except OSError:
+            self._file = None
+
+    def _to_file(self, text: str):
+        if self._file:
+            try:
+                self._file.write(text)
+                self._file.flush()
+            except OSError:
+                pass
 
     def _set_last_line(self, text: str):
         c = self.textCursor()
@@ -47,6 +67,8 @@ class LogView(QPlainTextEdit):
 
     def feed(self, text: str):
         text = ANSI_RE.sub("", text).replace("\r\n", "\n")
+        if "\r" not in text:  # progress bars would bloat the file
+            self._to_file(text)
         parts = text.split("\n")
         for i, part in enumerate(parts):
             if "\r" in part:
@@ -154,12 +176,18 @@ class CommandRunner(QObject):
         return self._proc.waitForFinished(ms) if self._proc else True
 
     def stop(self):
-        """SIGINT first so Python runs its cleanup (temp files), then kill."""
+        """SIGINT first so Python runs its cleanup (temp files), then kill.
+        Windows has no SIGINT for other processes: end the whole process tree."""
         if not self._proc:
             return
         self._stopping = True
         self._queue = []
         pid = self._proc.processId()
+        if os.name == "nt":
+            import subprocess
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
+                           creationflags=0x08000000)  # CREATE_NO_WINDOW
+            return
         try:
             os.kill(pid, signal.SIGINT)
         except (ProcessLookupError, PermissionError):

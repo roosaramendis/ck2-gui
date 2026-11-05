@@ -1,8 +1,8 @@
-# CorridorKey 2.0 GUI (Linux + macOS)
+# CorridorKey 2.0 GUI (Windows, Linux, macOS)
 
 A PySide6 front-end and installer for CorridorKey 2.0. It has three engines:
 
-| | Linux (NVIDIA) | macOS: Apple GPU (default) | macOS: MLX port |
+| | Windows / Linux (NVIDIA) | macOS: Apple GPU (default) | macOS: MLX port |
 |---|---|---|---|
 | Engine | official [CorridorKey2.0](https://github.com/nikopueringer/CorridorKey2.0) | the same official engine, run on the Apple GPU through `ck2/apple_gpu.py` | community [corridorkey-v2-mlx](https://github.com/peterteravskis/corridorkey-v2-mlx) |
 | Resolution | native, any size | native, any size | ≈1280×720 / ≈1536×1024 only (1080p+ is scaled down) |
@@ -14,25 +14,52 @@ A PySide6 front-end and installer for CorridorKey 2.0. It has three engines:
 lacks fall back to the CPU. This needs macOS 14 or newer on Apple Silicon. You pick
 the Mac engine in Setup (the app restarts to switch). Intel Macs can't run either one.
 
-## Run
+## Install
 
-Linux (fish):
-```fish
-sudo pacman -S --needed uv git ffmpeg
-tar -xzf ck2-gui.tar.gz -C ~/apps
-~/apps/ck2-gui/ck2-gui
-```
+Download the file for your system from the
+[releases page](https://github.com/roosaramendis/ck2-gui/releases):
 
-macOS (Terminal, after installing Homebrew from https://brew.sh):
+| System | File | How |
+|---|---|---|
+| Windows 10/11 + NVIDIA | `CK2-Setup-<version>.exe` | Run it. If Windows shows "Windows protected your PC", click **More info → Run anyway** (the installer isn't code-signed). |
+| Linux (Ubuntu, Fedora, Arch, Gentoo, …) + NVIDIA | `CK2-<version>-x86_64.AppImage` | Make it executable (`chmod +x CK2-*.AppImage`, or Properties → Allow executing), then double-click. If it says FUSE is missing, run it with `--appimage-extract-and-run`. |
+| macOS 14+ on Apple Silicon | `CK2-<version>-macOS-arm64.dmg` | Drag **CorridorKey 2.0** to Applications. The first time, macOS blocks it because it isn't notarized: open **System Settings → Privacy & Security** and click **Open Anyway**. |
+
+You need the NVIDIA driver (Windows/Linux). Nothing else: the app downloads its own
+helper tools (uv, ffmpeg) and doesn't need a package manager, Python or git.
+
+In the app, go to **Setup** and press **Install / repair everything**. That downloads
+CorridorKey 2.0, PyTorch and the model weights (about 12 GB in total). Then use **Key**.
+On a Mac, check the **Mac engine** in Setup first.
+
+### DCC plugins
+
+**Setup → DCC plugins** lists the CorridorKey plugins published as
+`github.com/roosaramendis/ck2-*` repos (today: DaVinci Resolve). **Install** downloads
+the latest release, installs it for your system and connects it to the engine; it
+asks once for your password (Windows: "allow changes"). **Update** appears when a new
+release is out.
+
+### Report a bug
+
+**Report a bug** (top right) saves your logs as a zip on the Desktop and opens a
+pre-filled GitHub issue: describe the problem, drag the zip in, press Submit.
+
+### Run from source (developers)
+
 ```sh
-brew install uv ffmpeg git
-mkdir -p ~/apps && tar -xzf ~/Downloads/ck2-gui.tar.gz -C ~/apps
-~/apps/ck2-gui/ck2-gui
+git clone https://github.com/roosaramendis/ck2-gui && cd ck2-gui
+./ck2-gui            # Linux/macOS, needs uv
+ck2-gui.bat          # Windows, needs uv
 ```
 
-The first start takes a minute while uv fetches PySide6. In the app, go to **Setup**,
-press **Install / repair everything**, then use **Key**. On a Mac, check the **Mac engine**
-in Setup first (and the model precision, if you're using the MLX port).
+### Make a release (maintainer)
+
+```sh
+git tag v1.0.0 && git push origin v1.0.0
+```
+GitHub Actions (`.github/workflows/release.yml`) builds the `.exe`, AppImage and `.dmg`
+and publishes them. "Run workflow" on the Actions tab builds them without a release.
 
 ## Roto tab (SAM 2.1): key only the character you want
 
@@ -68,7 +95,11 @@ Dropping a folder of clips adds all of them.
 
 ## Files
 
-- `ck2-gui` – launcher (`uv run --script`; adds Homebrew to PATH on macOS)
+- `ck2-gui`, `ck2-gui.bat` – run from source (`uv run --script`)
+- `packaging/` – PyInstaller spec, Inno Setup script (Windows), AppImage builder, icons
+- `ck2/tools.py` – app folders, downloads uv/ffmpeg/engine (no package manager), `--task` mode
+- `ck2/dcc_plugins.py`, `ck2/plugins_panel.py` – DCC plugins from github.com/roosaramendis/ck2-*
+- `ck2/bugreport.py` – Report a bug
 - `ck2_gui.py` – entry point (PEP 723 header pulls in PySide6)
 - `ck2/jobs.py` – clip and hint discovery, both engines' arguments, Mac size fitting and
   ffmpeg prep (no Qt)

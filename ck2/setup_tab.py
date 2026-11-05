@@ -12,13 +12,15 @@ from PySide6.QtCore import QProcess, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSplitter, QVBoxLayout, QWidget,
 )
 from PySide6.QtCore import Qt
 
 from . import jobs
-from .plat import (APPLE_GPU_WRAPPER, BACKEND, IS_MAC, MAC_ENGINES, MAC_UI, apple_silicon,
+from . import tools
+from .plat import (APPLE_GPU_WRAPPER, BACKEND, IS_MAC, IS_WIN, MAC_ENGINES, MAC_UI, apple_silicon,
                    install_launcher)
+from .plugins_panel import PluginsPanel
 from .procs import Cmd, CommandRunner, LogView
 from .settings import AppSettings
 
@@ -85,13 +87,13 @@ class SetupTab(QWidget):
             return self._mac_steps()
         if BACKEND == "mps":
             return self._apple_gpu_steps()
-        return self._linux_steps()
+        return self._cuda_steps()
 
     def _apple_gpu_steps(self) -> list[Step]:
         """Official engine on the Apple GPU: Homebrew tools + the official repo,
         macOS PyTorch, and apple_gpu.py to redirect CUDA calls to MPS."""
         mac = {s.key: s for s in self._mac_steps()}
-        lin = {s.key: s for s in self._linux_steps()}
+        lin = {s.key: s for s in self._cuda_steps()}
         wrap = str(APPLE_GPU_WRAPPER)
 
         def torch_check():
@@ -129,7 +131,7 @@ class SetupTab(QWidget):
             mac["venv"],
             Step("torch", "PyTorch 2.9.1 for macOS",
                  "The macOS build includes Apple GPU (MPS) support. ~1 GB download.",
-                 lambda: [Cmd(["uv", "pip", "install", "--python", str(self.py),
+                 lambda: [Cmd([tools.uv(), "pip", "install", "--python", str(self.py),
                                *jobs.TORCH_PINS])],
                  check_cmd=torch_check),
             lin["reqs"],
@@ -140,27 +142,29 @@ class SetupTab(QWidget):
                  verify_install, recheck=False),
         ]
 
-    def _linux_steps(self) -> list[Step]:
-        def sys_ok():
-            return all(shutil.which(t) for t in ("git", "ffmpeg", "uv"))
+    def _cuda_steps(self) -> list[Step]:
+        """NVIDIA on Linux (any distro) and Windows. Needs no package manager:
+        uv and ffmpeg are downloaded into the app's own tools folder."""
+        def tools_ok():
+            return bool(tools.find_tool("uv") and tools.find_tool("ffmpeg"))
 
-        def sys_install():
+        def tools_install():
             if not shutil.which("nvidia-smi"):
                 self.log.line("[warn] nvidia-smi not found: the NVIDIA driver "
-                              "doesn't look installed. CorridorKey needs CUDA.")
-            return [Cmd(["pkexec", "pacman", "-S", "--needed", "--noconfirm",
-                         "git", "ffmpeg", "uv"])]
+                              "doesn't look installed. CorridorKey needs an NVIDIA GPU + driver.")
+            return [Cmd(tools.self_cmd("fetch-tools"))]
 
         def clone():
             eng = self.engine
-            if eng.exists() and any(eng.iterdir()) and not (eng / ".git").exists():
-                self.log.line(f"[error] {eng} exists and isn't a CorridorKey2.0 "
-                              "checkout. Pick an empty or new folder.")
+            is_git = (eng / ".git").exists()
+            if eng.exists() and any(eng.iterdir()) and not is_git and not (eng / "infer.py").exists():
+                self.log.line(f"[error] {eng} exists and isn't a CorridorKey2.0 folder. "
+                              "Pick an empty or new folder.")
                 return []
             eng.parent.mkdir(parents=True, exist_ok=True)
-            if (eng / ".git").exists():
+            if is_git and shutil.which("git"):
                 return [Cmd(["git", "-C", str(eng), "pull", "--ff-only"])]
-            return [Cmd(["git", "clone", jobs.REPO_URL, str(eng)])]
+            return [Cmd(tools.self_cmd("fetch-repo", jobs.REPO_URL, str(eng)))]
 
         def venv_check():
             if not self.py.exists():
@@ -207,26 +211,28 @@ class SetupTab(QWidget):
                         cwd=self.engine)]
 
         return [
-            Step("system", "System packages",
-                 "git, ffmpeg and uv from the Arch repos (asks for your password via pkexec).",
-                 sys_install, check_fn=sys_ok),
+            Step("system", "Helper tools",
+                 "uv (Python installer) and ffmpeg, downloaded into the app's own folder. "
+                 "No admin rights or package manager needed.",
+                 tools_install, check_fn=tools_ok),
             Step("engine", "Get CorridorKey 2.0",
-                 "Clones github.com/nikopueringer/CorridorKey2.0 into the engine folder.",
+                 "Downloads github.com/nikopueringer/CorridorKey2.0 into the engine folder.",
                  clone, check_fn=lambda: (self.engine / "infer.py").is_file()),
             Step("venv", "Python 3.12 environment",
                  "Creates engine/venv with uv (your system Python is too new for numpy<2).",
-                 lambda: [Cmd(["uv", "venv", "--clear", "--python", jobs.PYTHON_VERSION,
+                 lambda: [Cmd([tools.uv(), "venv", "--clear", "--python", jobs.PYTHON_VERSION,
                                "venv"], cwd=self.engine)],
                  check_cmd=venv_check),
             Step("torch", "PyTorch 2.9.1 (CUDA 12.8)",
                  "The version CorridorKey 2.0 was tested with. ~3 GB download.",
-                 lambda: [Cmd(["uv", "pip", "install", "--python", str(self.py),
+                 lambda: [Cmd([tools.uv(), "pip", "install", "--python", str(self.py),
                                *jobs.TORCH_PINS, "--index-url", jobs.TORCH_INDEX])],
                  check_cmd=torch_check),
             Step("reqs", "Python requirements",
                  "transformers, timm, opencv, utils3d … from requirements.txt.",
-                 lambda: [Cmd(["uv", "pip", "install", "--python", str(self.py),
-                               "-r", "requirements.txt"], cwd=self.engine)],
+                 lambda: [Cmd(tools.self_cmd("fix-reqs", str(self.engine)), quiet=True),
+                          Cmd([tools.uv(), "pip", "install", "--python", str(self.py),
+                               "-r", "requirements-ck2.txt"], cwd=self.engine)],
                  check_cmd=reqs_check),
             Step("weights", "Model weights (~5 GB)",
                  "CorridorKey 2.0 + C-RADIO (NVIDIA), MoGe-2 (Microsoft), RVM (Google).",
@@ -322,12 +328,12 @@ class SetupTab(QWidget):
                  clone, check_fn=lambda: (self.engine / "corridorkey_mlx" / "cli.py").is_file()),
             Step("venv", "Python 3.12 environment",
                  "Creates engine/venv with uv (the engine requires exactly Python 3.12).",
-                 lambda: [Cmd(["uv", "venv", "--clear", "--python", jobs.PYTHON_VERSION,
+                 lambda: [Cmd([tools.uv(), "venv", "--clear", "--python", jobs.PYTHON_VERSION,
                                "venv"], cwd=self.engine)],
                  check_cmd=venv_check),
             Step("pkgs", "Python packages",
                  "MLX, PyTorch (CPU side only), OpenCV, Hugging Face CLI.",
-                 lambda: [Cmd(["uv", "pip", "install", "--python", str(self.py),
+                 lambda: [Cmd([tools.uv(), "pip", "install", "--python", str(self.py),
                                "-e", ".[download]"], cwd=self.engine)],
                  check_cmd=pkgs_check),
             Step("weights", "Model files (selected precision)",
@@ -426,24 +432,40 @@ class SetupTab(QWidget):
         grid.addLayout(btns, len(self.steps), 0, 1, 4)
 
         tools = QHBoxLayout()
-        for text, fn in (("Update engine (git pull)", self._update_engine),
-                         ("Add to Applications" if IS_MAC else "Add to app menu",
+        for text, fn in (("Update engine", self._update_engine),
+                         ("Add to Applications" if IS_MAC else "Add to Start menu" if IS_WIN
+                          else "Add to app menu",
                           self._make_desktop_entry),
                          ("Clear temp cache", self._clear_temp),
                          ("Open engine folder", lambda: self._open(self.engine))):
             b = QPushButton(text)
             b.clicked.connect(fn)
             tools.addWidget(b)
-            if text.startswith("Update"):
+            if text.startswith("Update engine"):
                 self.update_btn = b
         tools.addStretch()
         grid.addLayout(tools, len(self.steps) + 1, 0, 1, 4)
 
         self.log = LogView()
+        self.log.persist("setup")
+        self.plugins = PluginsPanel(self.s, self.log)
+        self.engine_changed.connect(lambda: self.plugins._render())
+        top = QWidget()
+        top_lay = QVBoxLayout(top)
+        top_lay.setContentsMargins(0, 0, 0, 0)
+        top_lay.addWidget(box)
+        top_lay.addWidget(self.plugins)
+        top_lay.addStretch()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(top)
         split = QSplitter(Qt.Orientation.Vertical)
-        split.addWidget(box)
+        split.addWidget(scroll)
         split.addWidget(self.log)
-        split.setStretchFactor(1, 1)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([620, 300])
         root.addWidget(split, 1)
 
     def _set_status(self, step: Step, state: str, tip: str = ""):
@@ -521,12 +543,17 @@ class SetupTab(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
 
     def _update_engine(self):
-        if not (self.engine / ".git").exists():
+        eng = self.engine
+        if not (eng / "infer.py").exists() and not (eng / ".git").exists():
             QMessageBox.information(self, "Update", "The engine isn't installed yet.")
             return
         self._set_busy(True)
         self._extra_cb = lambda ok: (self._set_busy(False), self.refresh_fast())
-        self.runner.run([Cmd(["git", "-C", str(self.engine), "pull", "--ff-only"])])
+        if (eng / ".git").exists() and shutil.which("git"):
+            self.runner.run([Cmd(["git", "-C", str(eng), "pull", "--ff-only"])])
+        else:  # downloaded as a zip: download the latest zip over it (keeps venv + weights)
+            url = jobs.MLX_REPO_URL if BACKEND == "mlx" else jobs.REPO_URL
+            self.runner.run([Cmd(tools.self_cmd("fetch-repo", url, str(eng)))])
 
     def _clear_temp(self):
         t = self.s.temp_dir
@@ -668,20 +695,22 @@ class SetupTab(QWidget):
     def _hint_on_failure(self, st: Step):
         hints = {
             "system": ("In Terminal:  brew install uv ffmpeg git" if MAC_UI else
-                       "If pkexec didn't ask for a password, run this in a terminal:\n"
-                       "    sudo pacman -S --needed git ffmpeg uv"),
+                       "Check your internet connection and run this step again."),
             "weights": "If the error mentions 401/403, open the model page named in the "
                        "error (for example "
                        "https://huggingface.co/nvidia/C-RADIOv4-SO400M), accept the "
                        "license, paste a read token into 'Hugging Face token' and run "
                        "this step again. Finished files are kept, so it resumes.",
-            "torch": "Check your internet connection and free disk space, then run again.",
+            "torch": "Check your internet connection and free disk space, then run again."
+                     + (" On Windows, if it mentions a path that is too long, use a shorter "
+                        "engine folder such as C:\\ck2\\CorridorKey2.0." if IS_WIN else ""),
             "verify": ("If it says 'missing profile files', run the model step again. "
                        "If it runs out of memory, pick FP16 or 8-bit above." if BACKEND == "mlx"
                        else "Paste the [apple-gpu] lines and the last error into the chat. "
                        "If an op is 'not implemented for MPS', PyTorch should fall back to the "
                        "CPU automatically; a crash there is what we need to see." if BACKEND == "mps"
-                       else "If CUDA isn't available, check `nvidia-smi` works in a terminal."),
+                       else "If CUDA isn't available, check `nvidia-smi` works in a terminal "
+                       "and the NVIDIA driver is up to date."),
             "pkgs": "Check your internet connection and free disk space, then run again.",
         }
         if st.key in hints:
@@ -700,7 +729,8 @@ class SetupTab(QWidget):
         self._pending = []
         self.runner.stop()
         self.checker.stop()
+        self.plugins.stop()
 
     @property
     def busy(self) -> bool:
-        return self.runner.running or self.checker.running
+        return self.runner.running or self.checker.running or self.plugins.busy

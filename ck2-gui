@@ -3,13 +3,13 @@
 # a small environment with PySide6 the first time; later starts are instant.
 here="$(cd "$(dirname "$0")" && pwd -P)"
 # Apps started from Finder/Dock/KDE menu may not have these on PATH.
-export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+export PATH="${XDG_DATA_HOME:-$HOME/.local/share}/ck2-gui/tools:$HOME/Library/Application Support/ck2-gui/tools:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 if ! command -v uv >/dev/null 2>&1; then
     if [ "$(uname -s)" = "Darwin" ]; then
         msg="uv is not installed. In Terminal run:  brew install uv ffmpeg git"
         osascript -e "display alert \"CorridorKey 2.0\" message \"$msg\"" >/dev/null 2>&1
     else
-        msg="uv is not installed. Run:  sudo pacman -S --needed uv git ffmpeg"
+        msg="uv is not installed. Get it with:  curl -LsSf https://astral.sh/uv/install.sh | sh   (or use the AppImage)"
         command -v notify-send >/dev/null && notify-send "CorridorKey 2.0" "$msg"
     fi
     echo "$msg" >&2

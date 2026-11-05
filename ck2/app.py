@@ -5,10 +5,10 @@ import shutil
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QTimer
+from PySide6.QtCore import QProcess, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import (
-    QApplication, QLabel, QMainWindow, QMessageBox, QTabWidget,
+    QApplication, QLabel, QMainWindow, QMessageBox, QPushButton, QTabWidget,
 )
 
 from .key_tab import KeyTab
@@ -98,7 +98,8 @@ class GpuMonitor(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self, initial_paths: list[Path]):
         super().__init__()
-        self.setWindowTitle("CorridorKey 2.0")
+        from . import __version__
+        self.setWindowTitle(f"CorridorKey 2.0  ·  {__version__}")
         icon = APP_ROOT / "ck2-gui.svg"
         if icon.exists():
             self.setWindowIcon(QIcon(str(icon)))
@@ -116,6 +117,10 @@ class MainWindow(QMainWindow):
         self.key.run_started.connect(self.roto.release)
         self.roto.applied.connect(self.key.job_updated)
         self.setCentralWidget(self.tabs)
+        bug = QPushButton("Report a bug")
+        bug.setToolTip("Collects your logs and opens a GitHub issue (you check it before sending)")
+        bug.clicked.connect(self.report_bug)
+        self.tabs.setCornerWidget(bug, Qt.Corner.TopRightCorner)
 
         self.setup.engine_changed.connect(self.key.refresh_engine)
         self.key.request_setup.connect(lambda: self.tabs.setCurrentWidget(self.setup))
@@ -134,6 +139,12 @@ class MainWindow(QMainWindow):
             self.key.add_paths(initial_paths)
             if not self.s.problem():
                 self.tabs.setCurrentWidget(self.key)
+
+    def report_bug(self):
+        from .bugreport import BugReportDialog
+        logs = {"setup": self.setup.log.toPlainText(), "key": self.key.log.toPlainText(),
+                "roto": self.roto.log.toPlainText()}
+        BugReportDialog(self.s, logs, self).exec()
 
     def _update_engine_lbl(self):
         prob = self.s.problem()
@@ -168,8 +179,25 @@ class MainWindow(QMainWindow):
         e.accept()
 
 
+def _log_crashes():
+    """Uncaught errors go to <app data>/logs/crash.log (included in bug reports)."""
+    from . import tools
+    old = sys.excepthook
+
+    def hook(t, v, tb):
+        import traceback
+        try:
+            with open(tools.log_dir() / "crash.log", "a", encoding="utf-8") as f:
+                f.write("".join(traceback.format_exception(t, v, tb)) + "\n")
+        except OSError:
+            pass
+        old(t, v, tb)
+    sys.excepthook = hook
+
+
 def main() -> int:
     fix_path()
+    _log_crashes()
     QApplication.setApplicationName("ck2-gui")
     QApplication.setDesktopFileName("ck2-gui")
     app = QApplication(sys.argv)

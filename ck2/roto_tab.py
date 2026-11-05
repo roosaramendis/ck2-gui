@@ -26,7 +26,8 @@ from .plat import BACKEND
 from .procs import LogView
 from .settings import AppSettings
 
-WORKER = Path(__file__).resolve().parent / "roto_worker.py"
+from .tools import resource_root  # noqa: E402
+WORKER = resource_root() / "ck2" / "roto_worker.py"  # a plain file in the packaged app too
 MODELS = [("facebook/sam2.1-hiera-large", "SAM 2.1 Large – best edges (~0.9 GB)"),
           ("facebook/sam2.1-hiera-base-plus", "SAM 2.1 Base+ – balanced (~0.3 GB)"),
           ("facebook/sam2.1-hiera-small", "SAM 2.1 Small – faster"),
@@ -487,6 +488,7 @@ class RotoTab(QWidget):
         pl.addWidget(self.apply_status)
 
         self.log = LogView()
+        self.log.persist("roto")
         self.log.setMinimumHeight(140)
         pl.addWidget(self.log, 1)
         scroll.setWidget(panel)

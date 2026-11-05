@@ -1,0 +1,102 @@
+# Builds the installers on every tag like v1.0.0 and attaches them to a release:
+#   Windows  CK2-Setup-1.0.0.exe          (installer, Start menu + desktop icon)
+#   Linux    CK2-1.0.0-x86_64.AppImage    (any distro: Ubuntu, Fedora, Arch, Gentoo, …)
+#   macOS    CK2-1.0.0-macOS-arm64.dmg    (Apple Silicon)
+# "Run workflow" on the Actions tab builds the same files without a release.
+name: Release ck2-gui
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, name: linux }
+          - { os: windows-2022, name: windows }
+          - { os: macos-14,     name: macos }
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Version from the tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF_NAME#v}"; else V="0.0.0-dev.${GITHUB_RUN_NUMBER}"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          sed -i.bak "s/^__version__ = .*/__version__ = \"$V\"/" ck2/__init__.py && rm ck2/__init__.py.bak
+          cat ck2/__init__.py
+
+      - name: Python packages
+        run: python -m pip install pyinstaller "PySide6>=6.7" certifi pillow
+
+      - name: Linux libraries for Qt
+        if: matrix.name == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libxcb-cursor0 libegl1 libxkbcommon-x11-0 libfuse2
+
+      - name: Icons
+        run: python packaging/make_icons.py
+
+      - name: PyInstaller
+        run: pyinstaller --noconfirm --distpath dist --workpath build/pyi packaging/ck2-gui.spec
+
+      - name: Smoke test (task mode)
+        shell: bash
+        run: |
+          if [ "${{ matrix.name }}" = macos ]; then T="dist/CorridorKey 2.0.app/Contents/MacOS/ck2-task"
+          elif [ "${{ matrix.name }}" = windows ]; then T="dist/ck2-gui/ck2-task.exe"
+          else T="dist/ck2-gui/ck2-task"; fi
+          "$T" --task nonexistent-task-name; test $? -eq 2
+
+      - name: AppImage (Linux)
+        if: matrix.name == 'linux'
+        run: |
+          curl -sSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool && sudo mv appimagetool /usr/local/bin/
+          bash packaging/build_appimage.sh "$VERSION"
+
+      - name: Installer (Windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          & $iscc "/DAppVersion=$env:VERSION" packaging\ck2-gui.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: DMG (macOS)
+        if: matrix.name == 'macos'
+        run: |
+          mkdir -p build/dmg && cp -R "dist/CorridorKey 2.0.app" build/dmg/ && ln -s /Applications build/dmg/Applications
+          hdiutil create -volname "CorridorKey 2.0" -srcfolder build/dmg -ov -format UDZO "dist/CK2-$VERSION-macOS-arm64.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ck2-gui-${{ matrix.name }}
+          path: |
+            dist/*.AppImage
+            dist/CK2-Setup-*.exe
+            dist/*.dmg
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.AppImage
+            dist/CK2-Setup-*.exe
+            dist/*.dmg
+          generate_release_notes: true
