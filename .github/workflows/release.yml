@@ -59,7 +59,7 @@ jobs:
           if [ "${{ matrix.name }}" = macos ]; then T="dist/CorridorKey 2.0.app/Contents/MacOS/ck2-task"
           elif [ "${{ matrix.name }}" = windows ]; then T="dist/ck2-gui/ck2-task.exe"
           else T="dist/ck2-gui/ck2-task"; fi
-          "$T" --task nonexistent-task-name; test $? -eq 2
+          rc=0; "$T" --task nonexistent-task-name || rc=$?; test $rc -eq 2
 
       - name: AppImage (Linux)
         if: matrix.name == 'linux'
