@@ -261,6 +261,7 @@ class RunSettings:
     hann_chunk: int = 48
     hann_stride: int = 24
     low_vram: bool = False
+    shared_vram: bool = True         # may spill into shared GPU memory (system RAM)
     num_frames: int = -1             # -1 = whole clip
     start_mode: str = "begin"
     out_parent: Path | None = None   # None = next to each clip
@@ -278,6 +279,56 @@ def default_out_dir(job: Job, out_parent: Path | None) -> Path:
 
 def job_out_dir(job: Job, s: RunSettings) -> Path:
     return job.out_dir or default_out_dir(job, s.out_parent)
+
+
+# ---------------------------------------------------------------- GPU memory
+
+# Started before the engine (Python runs sitecustomize.py from PYTHONPATH by itself):
+# keeps PyTorch inside the GPU's own memory, so running out of it is an error
+# instead of a slow spill into shared GPU memory (system RAM). The engine itself
+# isn't changed.
+VRAM_HOOK = """\
+# CorridorKey: keep PyTorch inside the GPU's own memory (no spill into shared GPU memory).
+import os
+if os.environ.get("CK2_NO_SHARED_VRAM") == "1":
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                free, total = torch.cuda.mem_get_info(i)
+                frac = max(0.05, min(0.98, (free - (256 << 20)) / total))
+                torch.cuda.set_per_process_memory_fraction(frac, i)
+                print("[ck2] shared GPU memory off: GPU %d limited to %.1f of %.1f GB"
+                      % (i, frac * total / 2**30, total / 2**30), flush=True)
+    except Exception as e:
+        print("[ck2] couldn't limit GPU memory: %s" % e, flush=True)
+"""
+
+OOM_WORDS = ("out of memory", "outofmemoryerror", "insufficient memory")
+CHUNKS = [80, 48, 24, 8, 1]
+
+
+def vram_env(shared: bool, hook_dir: Path) -> dict[str, str]:
+    """Environment for the engine: {} when it may use shared GPU memory."""
+    if shared:
+        return {}
+    hook_dir.mkdir(parents=True, exist_ok=True)
+    f = hook_dir / "sitecustomize.py"
+    if not f.exists() or f.read_text(encoding="utf-8") != VRAM_HOOK:
+        f.write_text(VRAM_HOOK, encoding="utf-8")
+    old = os.environ.get("PYTHONPATH", "")
+    return {"CK2_NO_SHARED_VRAM": "1",
+            "PYTHONPATH": str(hook_dir) + (os.pathsep + old if old else "")}
+
+
+def smaller_chunk(used: int | None) -> int:
+    """The next smaller temporal window after `used` (24 if unknown)."""
+    if not used:
+        return 24
+    for c in CHUNKS:
+        if c < used:
+            return c
+    return 1
 
 
 def build_args(job: Job, s: RunSettings, engine: Path) -> list[str]:

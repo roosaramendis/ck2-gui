@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -30,6 +31,7 @@ HINT_TEXT = {"none": "no hint", "first": "first-frame hint", "video": "hint vide
 WINDOW_PRESETS = [(80, 40), (48, 24), (24, 12), (8, 4), (1, 1)]
 
 WINDOW_RE = re.compile(r"window (\d+)/(\d+)")
+CHUNK_RE = re.compile(r"hann_chunk=(\d+)")
 MLX_RE = re.compile(r"^(Features|Export) (\d+)/(\d+)")
 FFMPEG_RE = re.compile(r"frame=\s*(\d+)")
 MLX = BACKEND == "mlx"   # MLX port UI (fixed sizes, no EXR)
@@ -104,6 +106,10 @@ class KeyTab(QWidget):
         self._run_list: list[Job] = []
         self._cur: Job | None = None
         self._cur_settings: RunSettings | None = None
+        self._retry: RunSettings | None = None  # this clip runs again with these (out of memory)
+        self._retried: set[int] = set()
+        self._oom = False
+        self._used_chunk: int | None = None
         self._stop_all = False
         self._linebuf = ""
         self._done_count = 0
@@ -288,6 +294,12 @@ class KeyTab(QWidget):
         f.addRow("Window:", self.window)
         self.low_vram = QCheckBox("Low-VRAM mode (spills features to the temp cache)")
         f.addRow(self.low_vram)
+        self.shared_vram = QCheckBox("Use shared GPU memory")
+        self.shared_vram.setToolTip(
+            "When the GPU's own memory is full, keep going in shared GPU memory (system RAM). "
+            "Slower, but it doesn't stop.\nOff: running out of GPU memory retries once with "
+            "Low-VRAM mode and a smaller window.")
+        f.addRow(self.shared_vram)
         self.mem_manual.toggled.connect(self.window.setEnabled)
         self.mem_manual.toggled.connect(self.low_vram.setEnabled)
         self.model_lbl = QLabel()
@@ -310,6 +322,8 @@ class KeyTab(QWidget):
             g.setTitle("Engine (Apple Silicon)")
             for wdg in (self.mem_auto, self.mem_manual, self.window, self.low_vram):
                 f.setRowVisible(wdg, False)
+        if MLX or MPS:  # one memory pool on a Mac: nothing to switch
+            f.setRowVisible(self.shared_vram, False)
         else:
             for wdg in (self.model_lbl, self.mlx_window, self.mlx_fit):
                 f.setRowVisible(wdg, False)
@@ -428,6 +442,7 @@ class KeyTab(QWidget):
         self.mem_manual.setChecked(not auto)
         self.window.setCurrentIndex(min(g("key/window", 1), len(WINDOW_PRESETS) - 1))
         self.low_vram.setChecked(g("key/low_vram", False))
+        self.shared_vram.setChecked(g("key/shared_vram", True))
         self.window.setEnabled(not auto)
         self.low_vram.setEnabled(not auto)
         whole = g("key/whole", True)
@@ -461,6 +476,7 @@ class KeyTab(QWidget):
         st("key/mem_auto", self.mem_auto.isChecked())
         st("key/window", self.window.currentIndex())
         st("key/low_vram", self.low_vram.isChecked())
+        st("key/shared_vram", self.shared_vram.isChecked())
         st("key/whole", self.whole.isChecked())
         st("key/nframes", self.nframes.value())
         st("key/start_mode", self.start_mode.currentData())
@@ -490,6 +506,7 @@ class KeyTab(QWidget):
             auto_memory=self.mem_auto.isChecked(),
             hann_chunk=chunk, hann_stride=stride,
             low_vram=self.low_vram.isChecked(),
+            shared_vram=self.shared_vram.isChecked() or MLX or MPS,
             num_frames=-1 if self.whole.isChecked() else self.nframes.value(),
             start_mode=self.start_mode.currentData(),
             out_parent=Path(parent).expanduser() if (self.out_custom.isChecked() and parent)
@@ -742,6 +759,8 @@ class KeyTab(QWidget):
         self.save_settings()
         s.temp_dir.mkdir(parents=True, exist_ok=True)
         self._cur_settings = s
+        self._retry = None
+        self._retried = set()
         self._run_list = todo
         for j in todo:
             j.status, j.note = "queued", ""
@@ -762,7 +781,8 @@ class KeyTab(QWidget):
         self._cur = j
         j.status = "running"
         self._paint_item(self.jobs.index(j))
-        s = self._cur_settings
+        s, self._retry = (self._retry or self._cur_settings), None
+        self._oom, self._used_chunk = False, None
         out = jobs.job_out_dir(j, s)
         out.mkdir(parents=True, exist_ok=True)
         eng = self.s.engine_dir
@@ -775,6 +795,8 @@ class KeyTab(QWidget):
         self.log.line(f"Keying {j.name}  →  {out}")
         self._linebuf = ""
         env = {"TMPDIR": str(s.temp_dir), "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+        if not (MPS or MLX):
+            env.update(jobs.vram_env(s.shared_vram, s.temp_dir / "ck2_vram_hook"))
         if MPS:
             args = jobs.build_args(j, s, eng)[1:]  # drop infer.py; the wrapper runs it
             env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -827,6 +849,11 @@ class KeyTab(QWidget):
             self.status.setText(f"{self._phase} · preparing frame {m.group(1)}"
                                 + (f"/{total}" if total else ""))
             return
+        m = CHUNK_RE.search(line)
+        if m:
+            self._used_chunk = int(m.group(1))
+        if any(w in line.lower() for w in jobs.OOM_WORDS):
+            self._oom = True
         m = WINDOW_RE.search(line)
         if m:
             i, n = int(m.group(1)), int(m.group(2))
@@ -856,6 +883,8 @@ class KeyTab(QWidget):
 
     def _on_job_finished(self, ok: bool):
         j = self._cur
+        if self._retry_out_of_memory(ok, j):
+            return
         self._cur = None
         prep = getattr(self, "_prep_dir", None)
         self._prep_dir = None
@@ -874,6 +903,27 @@ class KeyTab(QWidget):
         if self._sel() is j:
             self._update_preview(j, prefer="Output: alpha")
         self._run_next()
+
+    def _retry_out_of_memory(self, ok: bool, j: Job | None) -> bool:
+        """Shared GPU memory off and the clip ran out of memory: run it once more with
+        Low-VRAM mode and a smaller window. True if it was queued again."""
+        s = self._cur_settings
+        if ok or j is None or self._stop_all or not self._oom or s is None or s.shared_vram \
+                or MLX or MPS or id(j) in self._retried:
+            return False
+        used = self._used_chunk or (None if s.auto_memory else s.hann_chunk)
+        if used == 1:
+            return False  # already as small as it gets
+        chunk = jobs.smaller_chunk(used)
+        self._retried.add(id(j))
+        self._retry = replace(s, auto_memory=False, hann_chunk=chunk,
+                              hann_stride=max(1, chunk // 2), low_vram=True)
+        self.log.line(f"Out of GPU memory: trying {j.name} again with Low-VRAM mode and a "
+                      f"{chunk}-frame window.")
+        self._cur = None
+        self._run_list.insert(0, j)
+        self._run_next()
+        return True
 
     def _all_finished(self):
         done = sum(1 for j in self.jobs if j.status == "done")

@@ -83,6 +83,15 @@ Apple GPU). It isn't available with the MLX engine. SAM 2.1 is unloaded automati
 when keying starts, so CorridorKey gets the GPU memory. Your clicks are saved in
 `<clip>_roto/roto.json`.
 
+## GPU memory (Key tab)
+
+- **Auto** picks the temporal window from free GPU memory; **Manual** lets you choose the
+  window and **Low-VRAM mode**.
+- **Use shared GPU memory** (on by default): when the GPU's own memory is full, keying keeps
+  going in shared GPU memory (system RAM). Slower, but it doesn't stop. Turn it off to keep
+  everything in the GPU's own memory: if a clip runs out of it, that clip is tried once more
+  by itself with Low-VRAM mode and a smaller window.
+
 ## Hint files it detects automatically
 
 | Next to the clip | Mode |
