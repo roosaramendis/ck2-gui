@@ -113,6 +113,8 @@ Needs **Setup → Roto models** once (below).
      stays in the matte: a common setup is the matte for the hair and the shapes to clean
      up the body.
 
+Roto works at the clip's **full resolution**: the masks, exact lassos and MatAnyone 2's edges are all made at full size. Only SAM looks at a smaller copy (1024 lines; the model always works at that size). At 4K MatAnyone 2 needs a lot of GPU memory: if it runs out, it tries again at 2160, 1440, then 1080 lines and says so in the log.
+
 ### Setup → Roto models
 
 The Roto tab (and the DaVinci Resolve plugin's **CorridorKey Roto** node) runs in its own

@@ -99,8 +99,14 @@ class Roto:
         self.frames = sorted(Path(frames_dir).glob("*.jpg"))
         if not self.frames:
             raise ValueError(f"no frames in {frames_dir}")
-        imgs = [Image.open(p).convert("RGB") for p in self.frames]
-        self.size = imgs[0].size
+        imgs = []
+        for p in self.frames:  # one at a time: only SAM's own size (short side 1024) stays in memory
+            with Image.open(p) as im:
+                self.size = im.size  # masks are made at this size (Roto: the clip's full resolution)
+                small, self.sam_scale = M.sam_copy(im.convert("RGB"))
+            imgs.append(small)
+        self.sam_size = imgs[0].size
+        self.objects = {}
         self.session = self.proc.init_video_session(
             video=imgs, inference_device=self.device, video_storage_device="cpu",
             dtype=self.dtype)
@@ -109,11 +115,23 @@ class Roto:
 
     # ------------------------------------------------------------ prompting
 
-    def _mask_png(self, pred_masks, out: Path):
+    def _exact(self, frame: int) -> dict:
+        """{object id: exact lassos} picked on this frame (drawn again at full size)."""
+        ex = {}
+        for oid, frames in self.objects.items():
+            p = frames.get(str(frame))
+            regs = M.exact_regions(self._object(p)) if p else []
+            if regs:
+                ex[int(oid)] = regs
+        return ex
+
+    def _mask_png(self, out_model, frame: int, out: Path):
+        """Mask PNG at full size; returns each object's probability."""
         w, h = self.size
-        prob = M.all_prob(self.proc, pred_masks, w, h)
+        prob, per = M.frame_probs(self.proc, out_model, self.session, w, h, self._exact(frame))
         out.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(out), (prob * 255).round().astype(np.uint8))
+        return per
 
     @staticmethod
     def _object(p: dict) -> dict:
@@ -126,12 +144,13 @@ class Roto:
         """Rebuild all prompts from scratch (makes undo/remove trivial)."""
         s = self.session
         s.reset_inference_session()
-        w, h = self.size
+        self.objects = objects
+        sw, sh = self.sam_size
         last = None
         for oid in sorted(objects, key=int):
             for fr in sorted(objects[oid], key=int):
                 o = M.add_object(self.proc, self.model, s, int(fr), int(oid),
-                                 self._object(objects[oid][fr]), 1.0, w, h)
+                                 self._object(objects[oid][fr]), self.sam_scale, sw, sh)
                 if o is not None:
                     last = o
         return last
@@ -144,7 +163,7 @@ class Roto:
                 cv2.imwrite(out, np.zeros((h, w), np.uint8))
                 return {"frame": frame, "out": out}
             o = self.model(inference_session=self.session, frame_idx=int(frame))
-            self._mask_png(o.pred_masks, Path(out))
+            self._mask_png(o, int(frame), Path(out))
         return {"frame": frame, "out": out}
 
     def track(self, objects: dict, out_dir: str, objects_dir: str | None = None):
@@ -162,13 +181,13 @@ class Roto:
             for rev in (False, True):
                 for o in self.model.propagate_in_video_iterator(
                         self.session, start_frame_idx=start, reverse=rev):
-                    self._mask_png(o.pred_masks, out / f"{o.frame_idx:06d}.png")
+                    probs = self._mask_png(o, o.frame_idx, out / f"{o.frame_idx:06d}.png")
                     if per is not None:
-                        for oid in self.session.obj_ids:
+                        for oid, po in probs.items():
                             d = per / str(oid)
                             d.mkdir(parents=True, exist_ok=True)
-                            m = M.object_prob(self.proc, o, self.session, oid, w, h) >= 0.5
-                            cv2.imwrite(str(d / f"{o.frame_idx:06d}.png"), m.astype(np.uint8) * 255)
+                            cv2.imwrite(str(d / f"{o.frame_idx:06d}.png"), (po >= 0.5).astype(np.uint8) * 255)
+                    del probs
                     done += 1
                     if done % 4 == 0 or done == n:
                         reply(progress=min(done, n), total=n)
@@ -333,8 +352,10 @@ class Roto:
         def write(i, a):
             cv2.imwrite(str(out / f"{i:06d}.png"), (a * 65535).round().astype(np.uint16))
 
-        mt.run(frames, anchor, (mask >= 128).astype(np.uint8), write,
-               progress=lambda d: reply(progress=d, total=len(frames)) if d % 4 == 0 else None)
+        used = mt.run_full(frames, anchor, (mask >= 128).astype(np.uint8), write,
+                           progress=lambda d: reply(progress=d, total=len(frames)) if d % 4 == 0 else None,
+                           log=lambda t: print(t, flush=True))
+        print(f"[roto] MatAnyone 2 at {'full resolution' if used is None else f'{used} lines'}", flush=True)
         del mt
         if self.device == "cuda":
             torch.cuda.empty_cache()
@@ -410,9 +431,7 @@ class Roto:
         full_w, full_h = int(size[0]), int(size[1])
         objs = {}
         for d in sorted((p for p in Path(objects_dir).iterdir() if p.is_dir()), key=lambda p: int(p.name)):
-            masks = {int(f.stem): cv2.imread(str(f), cv2.IMREAD_GRAYSCALE) >= 128
-                     for f in sorted(d.glob("*.png"))}
-            objs[f"Object {d.name}"] = M.track_shape(masks)
+            objs[f"Object {d.name}"] = M.track_shape(M.MaskFolder(d))
         if not any(objs.values()):
             raise ValueError("no tracked shapes: track first")
         first = next(Path(objects_dir).glob("*/*.png"))

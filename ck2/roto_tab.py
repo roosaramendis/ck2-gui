@@ -41,7 +41,7 @@ MODELS = [("facebook/sam2.1-hiera-large", "SAM 2.1 Large – best edges (~0.9 GB
 SAM3 = ("facebook/sam3", "SAM 3 – newest (needs a Hugging Face token, see Setup)")
 OBJ_COLORS = ["#3ddc84", "#4fa3ff", "#ffb347", "#ff6bd6", "#b388ff", "#ffd54f"]
 DISPLAY_MAX = 1280  # Hint: SAM works at 1024 internally; display/mask frames this wide
-MATTE_MAX = 1920   # Roto: MatAnyone 2 works up to 1080 lines, so its frames are bigger
+# Roto keeps the clip's full resolution (SAM gets its own 1024 copy inside the worker).
 
 
 def roto_env_python(engine: Path) -> Path:
@@ -869,7 +869,17 @@ class RotoTab(QWidget):
         self._load_state()
         if force and frames.is_dir():
             shutil.rmtree(frames, ignore_errors=True)
-        if frames.is_dir() and any(frames.glob("*.jpg")):
+        first = next(iter(sorted(frames.glob("*.jpg"))), None) if frames.is_dir() else None
+        old_w = QImage(str(first)).width() if first is not None and self.matte else 0
+        if old_w and old_w < self._full_size()[0]:
+            self.log.line("These frames were made smaller than the clip: making them again at full "
+                          "resolution (your picks are kept; track again afterwards).")
+            shutil.rmtree(frames, ignore_errors=True)
+            self._scale_prompts(self._full_size()[0] / old_w)
+            self._save_state()
+            self.stale = self.stale or self.tracked
+            first = None
+        if first is not None:
             self._frames_ready()
             return
         frames.mkdir(parents=True, exist_ok=True)
@@ -883,9 +893,11 @@ class RotoTab(QWidget):
                     "-pattern_type", "glob", "-i", f"{jobs.glob.escape(str(src))}/*{ext}"]
         else:
             args = ["-v", "error", "-y", "-i", str(src), "-fps_mode", "passthrough"]
-        size = MATTE_MAX if self.matte else DISPLAY_MAX
-        args += ["-vf", f"scale='min({size},iw)':-2", "-q:v", "2" if self.matte else "3", "-start_number", "0",
-                 str(frames / "%06d.jpg")]
+        if self.matte:  # Roto: full resolution, best JPEG quality
+            args += ["-q:v", "1", "-qmin", "1", "-start_number", "0", str(frames / "%06d.jpg")]
+        else:
+            args += ["-vf", f"scale='min({DISPLAY_MAX},iw)':-2", "-q:v", "3", "-start_number", "0",
+                     str(frames / "%06d.jpg")]
         self.track_status.setText("Extracting frames…")
         self.view.set_message(f"Extracting frames from {j.name}…")
         self.log.line(f"Extracting frames for {self.name}…")
@@ -1223,6 +1235,19 @@ class RotoTab(QWidget):
                          margin=self._scaled(self.margin.value()),
                          feather=self._scaled(self.feather.value()),
                          screen=self.screen.currentData())
+
+    def _scale_prompts(self, k: float):
+        """Picks were saved on smaller frames: move them to the new frame size."""
+        def sc(v):
+            return [round(x * k, 1) for x in v]
+        for frames in self.prompts.values():
+            for p in frames.values():
+                p["points"] = [sc(pt) for pt in p.get("points") or []]
+                if p.get("box"):
+                    p["box"] = sc(p["box"])
+                for r in p.get("regions") or []:
+                    r["poly"] = [sc(pt) for pt in r.get("poly") or []]
+        self.undo = []
 
     def _full_size(self) -> tuple[int, int]:
         info = jobs.probe(self._source(self.job))
