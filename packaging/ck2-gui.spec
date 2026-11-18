@@ -14,6 +14,8 @@ ICON = str(ROOT / "packaging" / ("ck2-gui.ico" if IS_WIN else "ck2-gui.icns" if 
 datas = [
     (str(ROOT / "ck2" / "apple_gpu.py"), "ck2"),     # run by the engine's own Python
     (str(ROOT / "ck2" / "roto_worker.py"), "ck2"),
+    (str(ROOT / "ck2" / "ck2_masks.py"), "ck2"),         # imported by roto_worker.py (engine / roto-env Python)
+    (str(ROOT / "ck2" / "setup_roto_env.py"), "ck2"),    # Setup -> Roto models
     (str(ROOT / "ck2-gui.svg"), "."),
 ]
 hidden = ["ck2.dcc_plugins", "ck2.bugreport", "ck2.plugins_panel", "certifi"]

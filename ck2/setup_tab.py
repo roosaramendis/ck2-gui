@@ -21,6 +21,7 @@ from . import tools
 from .plat import (APPLE_GPU_WRAPPER, BACKEND, IS_MAC, IS_WIN, MAC_ENGINES, MAC_UI, apple_silicon,
                    install_launcher)
 from .plugins_panel import PluginsPanel
+from .roto_models import RotoModelsPanel
 from .procs import Cmd, CommandRunner, LogView
 from .settings import AppSettings
 
@@ -49,6 +50,7 @@ class Step:
 
 class SetupTab(QWidget):
     engine_changed = Signal()
+    roto_models_changed = Signal()
 
     def __init__(self, settings: AppSettings, parent=None):
         super().__init__(parent)
@@ -450,10 +452,14 @@ class SetupTab(QWidget):
         self.log.persist("setup")
         self.plugins = PluginsPanel(self.s, self.log)
         self.engine_changed.connect(lambda: self.plugins._render())
+        self.roto_models = RotoModelsPanel(self.s, self.log)
+        self.roto_models.changed.connect(self.roto_models_changed)
+        self.engine_changed.connect(self.roto_models.refresh)
         top = QWidget()
         top_lay = QVBoxLayout(top)
         top_lay.setContentsMargins(0, 0, 0, 0)
         top_lay.addWidget(box)
+        top_lay.addWidget(self.roto_models)
         top_lay.addWidget(self.plugins)
         top_lay.addStretch()
         scroll = QScrollArea()
@@ -579,6 +585,7 @@ class SetupTab(QWidget):
 
     def refresh_fast(self):
         """Instant checks only (no subprocesses)."""
+        self.roto_models.refresh()
         self._update_space()
         for st in self.steps:
             if st.check_fn:
@@ -730,7 +737,9 @@ class SetupTab(QWidget):
         self.runner.stop()
         self.checker.stop()
         self.plugins.stop()
+        self.roto_models.runner.stop()
 
     @property
     def busy(self) -> bool:
-        return self.runner.running or self.checker.running or self.plugins.busy
+        return (self.runner.running or self.checker.running or self.plugins.busy
+                or self.roto_models.runner.running)

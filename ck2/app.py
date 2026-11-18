@@ -109,13 +109,17 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.setup = SetupTab(self.s)
         self.key = KeyTab(self.s)
-        self.roto = RotoTab(self.s, self.key)
+        self.hint = RotoTab(self.s, self.key)              # helper matte for CorridorKey's Hint input
+        self.roto = RotoTab(self.s, self.key, matte=True)  # real roto: soft matte + editable shapes
         self.tabs.addTab(self.key, "Key")
+        self.tabs.addTab(self.hint, "Hint")
         self.tabs.addTab(self.roto, "Roto")
         self.tabs.addTab(self.setup, "Setup")
-        self.key.jobs_changed.connect(self.roto.refresh_clips)
-        self.key.run_started.connect(self.roto.release)
-        self.roto.applied.connect(self.key.job_updated)
+        for t in (self.hint, self.roto):
+            self.key.jobs_changed.connect(t.refresh_clips)
+            self.key.run_started.connect(t.release)
+        self.hint.applied.connect(self.key.job_updated)
+        self.setup.roto_models_changed.connect(self.roto.refresh_clips)
         self.setCentralWidget(self.tabs)
         bug = QPushButton("Report a bug")
         bug.setToolTip("Collects your logs and opens a GitHub issue (you check it before sending)")
@@ -143,7 +147,7 @@ class MainWindow(QMainWindow):
     def report_bug(self):
         from .bugreport import BugReportDialog
         logs = {"setup": self.setup.log.toPlainText(), "key": self.key.log.toPlainText(),
-                "roto": self.roto.log.toPlainText()}
+                "hint": self.hint.log.toPlainText(), "roto": self.roto.log.toPlainText()}
         BugReportDialog(self.s, logs, self).exec()
 
     def _update_engine_lbl(self):
@@ -158,8 +162,8 @@ class MainWindow(QMainWindow):
             self.setup.check_all()  # slower import checks run in the background
         if self.tabs.currentWidget() is self.key:
             self.key.refresh_engine()
-        if self.tabs.currentWidget() is self.roto:
-            self.roto.refresh_clips()
+        if self.tabs.currentWidget() in (self.hint, self.roto):
+            self.tabs.currentWidget().refresh_clips()
 
     def closeEvent(self, e):
         if self.key.busy or self.setup.busy:
@@ -175,6 +179,7 @@ class MainWindow(QMainWindow):
             self.setup.runner.wait(3000)
         self.key.save_settings()
         self.key.preview.cleanup()
+        self.hint.shutdown()
         self.roto.shutdown()
         e.accept()
 

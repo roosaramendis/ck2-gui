@@ -1,6 +1,11 @@
-"""Roto tab: click a character, SAM 2.1 tracks them, and the result becomes
-CorridorKey's hint video plus a garbage matte that paints everything outside
-them (crew, stands, other actors) with the clip's own screen colour."""
+"""Hint and Roto tabs (one class, `matte` picks the mode).
+
+Hint: pick what to keep (points, boxes, lassos), SAM 2.1 tracks it, and the result becomes
+CorridorKey's hint video plus a garbage matte that paints everything outside it (crew,
+stands, other actors) with the clip's own screen colour.
+
+Roto: the same picking, run in the optional Roto environment (<engine>/roto-env: SAM 2.1 /
+SAM 3, MatAnyone 2 for soft edges), exported as alpha / cutout EXRs and Fusion shapes."""
 from __future__ import annotations
 
 import json
@@ -8,16 +13,17 @@ import os
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QProcessEnvironment, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QProcess, QProcessEnvironment, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
-    QBrush, QColor, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut,
+    QBrush, QColor, QDesktopServices, QImage, QKeySequence, QPainter, QPainterPath, QPen, QPixmap,
+    QPolygonF, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFormLayout, QGraphicsEllipseItem, QGraphicsPixmapItem,
-    QGraphicsSimpleTextItem, QGridLayout, QSizePolicy,
-    QGraphicsRectItem, QGraphicsScene, QGraphicsView, QGroupBox, QHBoxLayout, QLabel,
-    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider, QSplitter, QVBoxLayout,
-    QWidget,
+    QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGraphicsEllipseItem,
+    QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsSimpleTextItem, QGridLayout, QLineEdit,
+    QSizePolicy, QGraphicsRectItem, QGraphicsScene, QGraphicsView, QGroupBox, QHBoxLayout, QLabel,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider, QSplitter, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from . import jobs
@@ -32,8 +38,21 @@ MODELS = [("facebook/sam2.1-hiera-large", "SAM 2.1 Large – best edges (~0.9 GB
           ("facebook/sam2.1-hiera-base-plus", "SAM 2.1 Base+ – balanced (~0.3 GB)"),
           ("facebook/sam2.1-hiera-small", "SAM 2.1 Small – faster"),
           ("facebook/sam2.1-hiera-tiny", "SAM 2.1 Tiny – fastest")]
+SAM3 = ("facebook/sam3", "SAM 3 – newest (needs a Hugging Face token, see Setup)")
 OBJ_COLORS = ["#3ddc84", "#4fa3ff", "#ffb347", "#ff6bd6", "#b388ff", "#ffd54f"]
-DISPLAY_MAX = 1280  # SAM works at 1024 internally; display/mask frames this wide
+DISPLAY_MAX = 1280  # Hint: SAM works at 1024 internally; display/mask frames this wide
+MATTE_MAX = 1920   # Roto: MatAnyone 2 works up to 1080 lines, so its frames are bigger
+
+
+def roto_env_python(engine: Path) -> Path:
+    """The Roto environment's Python (<engine>/roto-env), made by Setup → Roto models."""
+    from .tools import IS_WIN
+    env = Path(engine) / "roto-env"
+    return env / ("Scripts/python.exe" if IS_WIN else "bin/python")
+
+
+def matanyone_installed(engine: Path) -> bool:
+    return (Path(engine) / "roto-env" / "models" / "matanyone2.pth").is_file()
 
 
 # ==================================================================== worker client
@@ -60,8 +79,11 @@ class RotoWorker(QProcess):
         self.device = "?"
         self.session_dir = None
 
-    def start_worker(self, python: Path, cwd: Path):
+    def start_worker(self, python: Path, cwd: Path, extra_env: dict | None = None):
         env = QProcessEnvironment.systemEnvironment()
+        for k, v in (extra_env or {}).items():
+            if v:
+                env.insert(k, v)
         env.insert("PYTHONUNBUFFERED", "1")
         env.insert("PYTORCH_ENABLE_MPS_FALLBACK", "1")
         for k in ("CK2_ROTO_RANDOM_WEIGHTS", "CK2_ROTO_DEVICE"):
@@ -102,7 +124,7 @@ class RotoWorker(QProcess):
             if msg.get("ready"):
                 self.ready = True
                 self.device = msg.get("device", "?")
-                self.log.emit(f"[roto] worker ready on {self.device} (torch {msg.get('torch')})\n")
+                self.log.emit(f"[worker] ready on {self.device} (torch {msg.get('torch')})\n")
                 self._pump()
             elif "progress" in msg:
                 self.progress.emit(int(msg["progress"]), int(msg["total"]))
@@ -110,7 +132,7 @@ class RotoWorker(QProcess):
                 cmd, cb = self._pending or ({}, None)
                 self._pending = None
                 if not msg.get("ok"):
-                    self.log.emit(f"[roto error] {msg.get('error')}\n")
+                    self.log.emit(f"[error] {msg.get('error')}\n")
                 if cb:
                     cb(msg)
                 self._pump()
@@ -121,7 +143,7 @@ class RotoWorker(QProcess):
         self.session_dir = None
         for _cmd, cb in pending:
             if cb:
-                cb({"ok": False, "error": "roto worker stopped"})
+                cb({"ok": False, "error": "worker stopped"})
         self.died.emit()
 
     def stop_worker(self, wait_ms=3000):
@@ -140,6 +162,7 @@ class RotoWorker(QProcess):
 class RotoView(QGraphicsView):
     clicked = Signal(float, float, int)        # x, y, label (1 include / 0 exclude)
     boxed = Signal(float, float, float, float)
+    lassoed = Signal(list, int)                # polygon [[x, y], ...], op (1 add / 0 cut away)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -158,7 +181,16 @@ class RotoView(QGraphicsView):
         self._marks: list = []
         self._drag = None
         self._band = None
+        self._lasso: list[QPointF] | None = None
+        self._lasso_item = None
+        self._lasso_op = 1
         self._fit = True
+        self.tool = "point"  # point / box / lasso
+
+    def set_tool(self, tool: str):
+        self.tool = tool
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor if tool != "point"
+                                  else Qt.CursorShape.ArrowCursor)
 
     def set_message(self, text: str):
         """Shown while no frame is loaded (the viewer would otherwise be black)."""
@@ -194,11 +226,30 @@ class RotoView(QGraphicsView):
         over.setAlphaChannel(mask.convertToFormat(QImage.Format.Format_Grayscale8))
         self.mask_item.setPixmap(QPixmap.fromImage(over))
 
-    def set_marks(self, points, box, color, dim_points=()):
+    def set_marks(self, points, box, color, dim_points=(), regions=(), dim_regions=()):
         for it in self._marks:
             self.scene().removeItem(it)
         self._marks = []
         r = max(4.0, self.frame_item.pixmap().width() / 220)
+        for reg, dim in [(g, False) for g in regions] + [(g, True) for g in dim_regions]:
+            poly = QPolygonF([QPointF(x, y) for x, y in reg.get("poly", [])])
+            if poly.size() < 3:
+                continue
+            col = QColor("#3ddc84" if reg.get("op", 1) else "#ff5252")
+            path = QPainterPath()
+            path.addPolygon(poly)
+            path.closeSubpath()
+            it = QGraphicsPathItem(path)
+            pen = QPen(col, max(1.5, r / 3),
+                       Qt.PenStyle.SolidLine if reg.get("exact", True) else Qt.PenStyle.DashLine)
+            fill = QColor(col)
+            fill.setAlpha(25 if dim else 45)
+            if dim:
+                pen.setColor(QColor(col.red(), col.green(), col.blue(), 110))
+            it.setPen(pen)
+            it.setBrush(QBrush(fill))
+            self.scene().addItem(it)
+            self._marks.append(it)
         for (x, y), lab, dim in [(p, lab, False) for p, lab in points] + \
                                 [(p, lab, True) for p, lab in dim_points]:
             fill = QColor("#3ddc84" if lab else "#ff5252")
@@ -222,7 +273,9 @@ class RotoView(QGraphicsView):
         if self.frame_item.pixmap().isNull():
             return
         p = self.mapToScene(e.position().toPoint())
-        if e.button() == Qt.MouseButton.LeftButton and e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+        mods = e.modifiers()
+        left = e.button() == Qt.MouseButton.LeftButton
+        if left and (mods & Qt.KeyboardModifier.ShiftModifier or self.tool == "box"):
             self._drag = p
             self._band = QGraphicsRectItem(QRectF(p, p))
             self._band.setPen(QPen(QColor("#ffd54f"), 2, Qt.PenStyle.DashLine))
@@ -231,34 +284,68 @@ class RotoView(QGraphicsView):
         if e.button() == Qt.MouseButton.MiddleButton:
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
             return super().mousePressEvent(e)
+        if self.tool == "lasso" and e.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            cut = e.button() == Qt.MouseButton.RightButton or bool(mods & Qt.KeyboardModifier.AltModifier)
+            self._lasso_op = 0 if cut else 1
+            self._lasso = [p]
+            self._lasso_item = QGraphicsPathItem()
+            col = QColor("#ff5252" if cut else "#3ddc84")
+            self._lasso_item.setPen(QPen(col, 2))
+            col.setAlpha(40)
+            self._lasso_item.setBrush(QBrush(col))
+            self.scene().addItem(self._lasso_item)
+            return
         if not self.frame_item.contains(p):
             return
-        if e.button() == Qt.MouseButton.LeftButton:
-            alt = e.modifiers() & (Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ControlModifier)
+        if left:
+            alt = mods & (Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ControlModifier)
             self.clicked.emit(p.x(), p.y(), 0 if alt else 1)
         elif e.button() == Qt.MouseButton.RightButton:
             self.clicked.emit(p.x(), p.y(), 0)
 
     def mouseMoveEvent(self, e):
+        p = self.mapToScene(e.position().toPoint())
         if self._drag is not None and self._band is not None:
-            p = self.mapToScene(e.position().toPoint())
             self._band.setRect(QRectF(self._drag, p).normalized())
+            return
+        if self._lasso is not None:
+            last = self._lasso[-1]
+            if (p - last).manhattanLength() * self.transform().m11() >= 3:  # ~3 screen pixels apart
+                self._lasso.append(p)
+                path = QPainterPath()
+                path.addPolygon(QPolygonF(self._lasso))
+                self._lasso_item.setPath(path)
             return
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
         if self._drag is not None:
+            start = self._drag
             rect = self._band.rect().intersected(self.frame_item.boundingRect())
             self.scene().removeItem(self._band)
             self._drag, self._band = None, None
             if rect.width() > 4 and rect.height() > 4:
                 self.boxed.emit(rect.left(), rect.top(), rect.right(), rect.bottom())
+            elif self.tool == "box" and self.frame_item.contains(start):
+                self.clicked.emit(start.x(), start.y(), 1)  # a click with the box tool: a point
+            return
+        if self._lasso is not None:
+            pts, op = self._lasso, self._lasso_op
+            self.scene().removeItem(self._lasso_item)
+            self._lasso, self._lasso_item = None, None
+            r = self.frame_item.boundingRect()
+            poly = [[round(min(max(q.x(), 0), r.width()), 1), round(min(max(q.y(), 0), r.height()), 1)]
+                    for q in pts]
+            area = abs(sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1)
+                           in zip(poly, poly[1:] + poly[:1], strict=False))) / 2
+            if len(poly) >= 3 and area > 16:
+                self.lassoed.emit(poly, op)
             return
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         super().mouseReleaseEvent(e)
 
     def contextMenuEvent(self, e):
-        e.accept()  # right-click = exclude point, never a menu
+        e.accept()  # right-click = exclude point / cut lasso, never a menu
 
     def wheelEvent(self, e):
         f = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15
@@ -300,11 +387,16 @@ def _slider(lo, hi, val, suffix=" px"):
 
 class RotoTab(QWidget):
     applied = Signal(object)  # Job
+    _tabs: list = []  # every Hint / Roto tab: only one keeps a model in GPU memory
 
-    def __init__(self, settings: AppSettings, key_tab, parent=None):
+    def __init__(self, settings: AppSettings, key_tab, matte: bool = False, parent=None):
         super().__init__(parent)
         self.s = settings
         self.key = key_tab
+        self.matte = matte
+        self.name = "Roto" if matte else "Hint"
+        self.ns = "rotomatte" if matte else "roto"  # settings keys (Hint keeps the old ones)
+        RotoTab._tabs.append(self)
         self.worker = RotoWorker(self)
         self.worker.log.connect(lambda t: self.log.feed(t))
         self.worker.progress.connect(self._on_progress)
@@ -322,6 +414,7 @@ class RotoTab(QWidget):
         self._prompt_busy = False
         self._preview_img: QPixmap | None = None
         self._extract: QProcess | None = None
+        self.edges_used = ""  # Roto: "matanyone" or "sam", for the last track
         self._build_ui()
         self._save_timer = QTimer(self, singleShot=True, interval=600)
         self._save_timer.timeout.connect(self._save_state)
@@ -342,9 +435,35 @@ class RotoTab(QWidget):
         self.banner.setWordWrap(True)
         self.banner.setStyleSheet("background:#4a3a14; color:#ffd27f; padding:8px; border-radius:4px")
         ll.addWidget(self.banner)
+        tools = QHBoxLayout()
+        self.tool_group = QButtonGroup(self)
+        self.tool_btns: dict[str, QToolButton] = {}
+        for key, text, tip in (
+                ("point", "Point  (P)", "Click on what to keep, right-click on what to remove."),
+                ("box", "Box  (B)", "Drag a rectangle around an object or area."),
+                ("lasso", "Lasso  (L)", "Draw around an area to add it; right-drag or Alt-drag "
+                                        "cuts an area away.")):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setCheckable(True)
+            b.clicked.connect(lambda _=False, k=key: self._set_tool(k))
+            self.tool_group.addButton(b)
+            self.tool_btns[key] = b
+            tools.addWidget(b)
+        self.exact_cb = QCheckBox("Lasso: exact edge")
+        self.exact_cb.setToolTip("On: the lasso's outline is the edge, exactly as drawn.\n"
+                                 "Off: SAM finds the real edge of what's inside the lasso.")
+        self.exact_cb.setChecked(bool(self.s.get(f"{self.ns}/lasso_exact", True, typ=bool)))
+        self.exact_cb.toggled.connect(lambda v: self.s.set(f"{self.ns}/lasso_exact", v))
+        tools.addSpacing(12)
+        tools.addWidget(self.exact_cb)
+        tools.addStretch()
+        ll.addLayout(tools)
         self.view = RotoView()
         self.view.clicked.connect(self._on_click)
         self.view.boxed.connect(self._on_box)
+        self.view.lassoed.connect(self._on_lasso)
         ll.addWidget(self.view, 1)
         nav = QHBoxLayout()
         self.prev_btn = QPushButton("◀")
@@ -360,11 +479,10 @@ class RotoTab(QWidget):
         for w in (self.prev_btn, self.scrub, self.next_btn, self.frame_lbl, self.fit_btn):
             nav.addWidget(w, 1 if w is self.scrub else 0)
         ll.addLayout(nav)
-        hint = QLabel("<b>Left-click</b> include · <b>Right-click</b> (or Ctrl/⌥-click) exclude · "
-                      "<b>Shift-drag</b> box · <b>Ctrl+Z</b> undo · <b>wheel</b> zoom · "
-                      "<b>←/→</b> frames")
-        hint.setStyleSheet("color:#9a9a9a")
-        ll.addWidget(hint)
+        self.help_lbl = QLabel()
+        self.help_lbl.setWordWrap(True)
+        self.help_lbl.setStyleSheet("color:#9a9a9a")
+        ll.addWidget(self.help_lbl)
         split.addWidget(left)
 
         # ---------------- right panel
@@ -389,11 +507,11 @@ class RotoTab(QWidget):
         f.addRow(self.load_btn)
         self.model_combo = QComboBox()
         self._narrow(self.model_combo)
-        for mid, text in MODELS:
+        for mid, text in MODELS + ([SAM3] if self.matte else []):
             self.model_combo.addItem(text, mid)
         default = "facebook/sam2.1-hiera-large" if BACKEND == "cuda" else "facebook/sam2.1-hiera-base-plus"
         self.model_combo.setCurrentIndex(max(0, self.model_combo.findData(
-            self.s.get("roto/model", default))))
+            self.s.get(f"{self.ns}/model", default))))
         f.addRow("Model:", self.model_combo)
         self.clip_info = QLabel("Add clips in the Key tab, then load one here.")
         self.clip_info.setWordWrap(True)
@@ -401,7 +519,7 @@ class RotoTab(QWidget):
         f.addRow(self.clip_info)
         pl.addWidget(g)
 
-        g = QGroupBox("2 · Select the character")
+        g = QGroupBox("2 · Select what to keep")
         f = QFormLayout(g)
         self.obj_combo = QComboBox()
         self._narrow(self.obj_combo)
@@ -442,6 +560,36 @@ class RotoTab(QWidget):
         f.addRow(self.track_status)
         pl.addWidget(g)
 
+        if self.matte:
+            self._build_matte_ui(pl)
+        else:
+            self._build_hint_ui(pl)
+
+        self.log = LogView()
+        self.log.persist(self.ns)
+        self.log.setMinimumHeight(140)
+        pl.addWidget(self.log, 1)
+        scroll.setWidget(panel)
+        split.addWidget(scroll)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 0)
+        split.setSizes([1040, 440])
+        for b in panel.findChildren(QPushButton):  # long labels shrink instead of widening the panel
+            if b.sizePolicy().horizontalPolicy() != QSizePolicy.Policy.Ignored:
+                b.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.view.set_message("Pick a clip on the right; it loads automatically.")
+
+        for seq, fn in ((QKeySequence.StandardKey.Undo, self._undo),
+                        (QKeySequence(Qt.Key.Key_Left), lambda: self.goto(self.frame - 1)),
+                        (QKeySequence(Qt.Key.Key_Right), lambda: self.goto(self.frame + 1)),
+                        (QKeySequence(Qt.Key.Key_P), lambda: self._set_tool("point")),
+                        (QKeySequence(Qt.Key.Key_B), lambda: self._set_tool("box")),
+                        (QKeySequence(Qt.Key.Key_L), lambda: self._set_tool("lasso"))):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.activated.connect(fn)
+        self._set_tool(self.s.get(f"{self.ns}/tool", "point") or "point")
+
+    def _build_hint_ui(self, pl):
         g = QGroupBox("4 · Hint for CorridorKey")
         f = QFormLayout(g)
         self.grow, w = _slider(-30, 30, int(self.s.get("roto/grow", 0)))
@@ -486,29 +634,90 @@ class RotoTab(QWidget):
         self.apply_status = QLabel("")
         self.apply_status.setWordWrap(True)
         pl.addWidget(self.apply_status)
-
-        self.log = LogView()
-        self.log.persist("roto")
-        self.log.setMinimumHeight(140)
-        pl.addWidget(self.log, 1)
-        scroll.setWidget(panel)
-        split.addWidget(scroll)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 0)
-        split.setSizes([1040, 440])
-        for b in panel.findChildren(QPushButton):  # long labels shrink instead of widening the panel
-            if b.sizePolicy().horizontalPolicy() != QSizePolicy.Policy.Ignored:
-                b.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        self.view.set_message("Pick a clip on the right; it loads automatically.")
-
-        for seq, fn in ((QKeySequence.StandardKey.Undo, self._undo),
-                        (QKeySequence(Qt.Key.Key_Left), lambda: self.goto(self.frame - 1)),
-                        (QKeySequence(Qt.Key.Key_Right), lambda: self.goto(self.frame + 1))):
-            sc = QShortcut(QKeySequence(seq), self)
-            sc.activated.connect(fn)
         for sl in (self.grow, self.soften, self.margin, self.feather):
             sl.valueChanged.connect(lambda _: self._save_timer.start())
         self.garbage_on.toggled.connect(lambda _: self._save_timer.start())
+
+    def _build_matte_ui(self, pl):
+        g = QGroupBox("4 · Edges")
+        f = QFormLayout(g)
+        self.edges = QComboBox()
+        self._narrow(self.edges)
+        self.edges.addItem("MatAnyone 2 – hair and motion blur (non-commercial licence)", "matanyone")
+        self.edges.addItem("SAM only – solid edges", "sam")
+        self.edges.setCurrentIndex(max(0, self.edges.findData(self.s.get(f"{self.ns}/edges", "matanyone"))))
+        self.edges.currentIndexChanged.connect(lambda _: (self._save_timer.start(), self._edges_note()))
+        f.addRow(self.edges)
+        self.edges_lbl = QLabel()
+        self.edges_lbl.setWordWrap(True)
+        self.edges_lbl.setStyleSheet("color:#9a9a9a")
+        f.addRow(self.edges_lbl)
+        pl.addWidget(g)
+
+        g = QGroupBox("5 · Export")
+        f = QFormLayout(g)
+        self.out_edit = QLineEdit(self.s.get(f"{self.ns}/out_dir", "") or "")
+        self.out_edit.setPlaceholderText("next to the clip: <clip>_roto_export")
+        b = QPushButton("…")
+        b.setFixedWidth(32)
+        b.clicked.connect(self._browse_out)
+        row = QHBoxLayout()
+        row.addWidget(self.out_edit, 1)
+        row.addWidget(b)
+        f.addRow("Folder:", row)
+        self.exp_alpha = QCheckBox("Matte – EXR sequence")
+        self.exp_cutout = QCheckBox("Cutout – RGBA EXR sequence (premultiplied)")
+        self.exp_shapes = QCheckBox("Shapes for Fusion (.setting, editable)")
+        self.exp_shapes.setToolTip("One keyframed Polygon mask per object: drag the file into Fusion's "
+                                   "node editor to fix the roto by hand. Shapes have solid edges; the "
+                                   "hair stays in the matte.")
+        for cb, k in ((self.exp_alpha, "alpha"), (self.exp_cutout, "cutout"), (self.exp_shapes, "shapes")):
+            cb.setChecked(bool(self.s.get(f"{self.ns}/exp_{k}", True, typ=bool)))
+            cb.toggled.connect(lambda _: self._save_timer.start())
+            f.addRow(cb)
+        pl.addWidget(g)
+        self.apply_btn = QPushButton("⬇  Export")
+        self.apply_btn.setObjectName("primary")
+        self.apply_btn.clicked.connect(self.export_matte)
+        pl.addWidget(self.apply_btn)
+        self.apply_status = QLabel("")
+        self.apply_status.setWordWrap(True)
+        pl.addWidget(self.apply_status)
+        self._edges_note()
+
+    def _edges_note(self):
+        if not self.matte:
+            return
+        if self.edges.currentData() == "matanyone" and not matanyone_installed(self.s.engine_dir):
+            self.edges_lbl.setText("MatAnyone 2 isn't installed (Setup → Roto models), so the edges "
+                                   "come from SAM.")
+        elif self.edges.currentData() == "matanyone":
+            self.edges_lbl.setText("Made by S-Lab, NTU: free for non-commercial use only "
+                                   "(NTU S-Lab License 1.0).")
+        else:
+            self.edges_lbl.setText("Solid edges from SAM, no extra licence.")
+
+    def _browse_out(self):
+        d = QFileDialog.getExistingDirectory(self, "Export folder", self.out_edit.text() or str(Path.home()))
+        if d:
+            self.out_edit.setText(d)
+            self._save_timer.start()
+
+    def _set_tool(self, tool: str):
+        if tool not in self.tool_btns:
+            tool = "point"
+        self.tool_btns[tool].setChecked(True)
+        self.view.set_tool(tool)
+        self.s.set(f"{self.ns}/tool", tool)
+        common = "<b>Ctrl+Z</b> undo · <b>wheel</b> zoom · <b>middle-drag</b> pan · <b>←/→</b> frames"
+        self.help_lbl.setText({
+            "point": "<b>Click</b> keep · <b>right-click</b> (or Ctrl/⌥-click) remove · "
+                     "<b>Shift-drag</b> box · ",
+            "box": "<b>Drag</b> a box around an object or area (each box is its own object: use "
+                   "+ Object for more) · <b>click</b> keep · <b>right-click</b> remove · ",
+            "lasso": "<b>Draw</b> around an area to add it · <b>right-drag</b> or <b>⌥/Alt-drag</b> "
+                     "cuts away · ",
+        }[tool] + common)
 
     @staticmethod
     def _narrow(combo: QComboBox):
@@ -539,14 +748,23 @@ class RotoTab(QWidget):
 
     def available(self) -> str | None:
         if BACKEND == "mlx":
-            return ("Roto needs the official engine's Python environment. Switch Setup → "
+            return (f"{self.name} needs the official engine's Python environment. Switch Setup → "
                     "Mac engine to 'Official engine on Apple GPU'.")
         py = jobs.venv_python(self.s.engine_dir)
         if not py.exists():
-            return "Install the engine in the Setup tab first (Roto reuses its Python environment)."
+            return (f"Install the engine in the Setup tab first ({self.name} reuses its Python "
+                    "environment).")
+        if self.matte and not self._python().exists():
+            return ("Roto runs in its own environment with the newest models: install it in "
+                    "Setup → Roto models (a few GB, once).")
         return None
 
+    def _python(self) -> Path:
+        eng = self.s.engine_dir
+        return roto_env_python(eng) if self.matte else jobs.venv_python(eng)
+
     def _update_enabled(self):
+        self._edges_note()
         why = self.available()
         self.banner.setVisible(bool(why))
         self.banner.setText(f"⚠  {why}" if why else "")
@@ -560,7 +778,11 @@ class RotoTab(QWidget):
         self.clip_combo.blockSignals(True)
         self.clip_combo.clear()
         for i, j in enumerate(self.key.jobs):
-            mark = "  ✓ roto" if getattr(j, "roto_dir", None) else ""
+            if self.matte:
+                mark = "  ✓ roto" if (self._roto_dir(j) / "matte").is_dir() or \
+                    (self._roto_dir(j) / "masks").is_dir() else ""
+            else:
+                mark = "  ✓ hint" if getattr(j, "roto_dir", None) else ""
             self.clip_combo.addItem(f"{j.name}{mark}", i)
         if cur is not None and cur < self.clip_combo.count():
             self.clip_combo.setCurrentIndex(cur)
@@ -572,12 +794,16 @@ class RotoTab(QWidget):
     def _ensure_worker(self) -> bool:
         why = self.available()
         if why:
-            QMessageBox.information(self, "Roto", why)
+            QMessageBox.information(self, self.name, why)
             return False
         if not self.worker.running():
+            for other in RotoTab._tabs:  # one SAM in GPU memory at a time
+                if other is not self:
+                    other.release()
             eng = self.s.engine_dir
-            self.log.line(f"Starting roto worker ({jobs.venv_python(eng)})…")
-            self.worker.start_worker(jobs.venv_python(eng), eng)
+            self.log.line(f"Starting the {self.name} worker ({self._python()})…")
+            self.worker.start_worker(self._python(), eng,
+                                     {"HF_TOKEN": self.s.get("roto/hf_token", "") or ""})
         return True
 
     def _ensure_model(self, then):
@@ -585,36 +811,38 @@ class RotoTab(QWidget):
         if self.worker.model == mid:
             then()
             return
-        self.s.set("roto/model", mid)
+        self.s.set(f"{self.ns}/model", mid)
         self.log.line(f"Loading {mid} (first time downloads it from Hugging Face)…")
-        self.track_status.setText("Loading SAM 2.1…")
+        self.track_status.setText("Loading SAM…")
 
         def done(r):
             if r.get("ok"):
                 self.worker.model = mid
-                self.log.line(f"SAM 2.1 ready on {r.get('device')} ({r.get('dtype')}).")
+                self.log.line(f"SAM ready on {r.get('device')} ({r.get('dtype')}).")
                 self.worker.session_dir = None
                 then()
             else:
-                self.track_status.setText("Model failed to load (see log).")
+                err = str(r.get("error", ""))
+                self.track_status.setText(err.split(": ", 1)[-1] if "gated" in err or "token" in err
+                                          else "Model failed to load (see log).")
             self._update_enabled()
         self.worker.send(done, cmd="load_model", model=mid)
 
     def _on_worker_died(self):
         self._prompt_busy = False
-        self.log.line("[roto] worker stopped.")
+        self.log.line("[worker] stopped.")
         self._update_enabled()
 
     def release(self):
         """Free GPU memory (called before CorridorKey keying starts)."""
         if self.worker.running():
-            self.log.line("Releasing SAM 2.1 so CorridorKey gets the GPU memory.")
+            self.log.line("Releasing SAM to free the GPU memory.")
             self.worker.stop_worker()
 
     # ================================================================ clip loading
 
-    def _roto_dir(self, j: Job) -> Path:
-        return j.source.parent / f"{j.name}_roto"
+    def _roto_dir(self, j: Job) -> Path:  # Hint keeps the old "_roto" folders of existing projects
+        return j.source.parent / f"{j.name}_{'rotomatte' if self.matte else 'roto'}"
 
     def _source(self, j: Job) -> Path:
         return getattr(j, "original_input", None) or j.input
@@ -637,7 +865,7 @@ class RotoTab(QWidget):
         self.dir.mkdir(parents=True, exist_ok=True)
         frames = self.dir / "frames"
         self.clip_info.setText(f"<b>{j.name}</b><br>{self._source(j)}<br>"
-                               f"<span style='color:#9a9a9a'>roto files: {self.dir}</span>")
+                               f"<span style='color:#9a9a9a'>{self.name.lower()} files: {self.dir}</span>")
         self._load_state()
         if force and frames.is_dir():
             shutil.rmtree(frames, ignore_errors=True)
@@ -655,11 +883,12 @@ class RotoTab(QWidget):
                     "-pattern_type", "glob", "-i", f"{jobs.glob.escape(str(src))}/*{ext}"]
         else:
             args = ["-v", "error", "-y", "-i", str(src), "-fps_mode", "passthrough"]
-        args += ["-vf", f"scale='min({DISPLAY_MAX},iw)':-2", "-q:v", "3", "-start_number", "0",
+        size = MATTE_MAX if self.matte else DISPLAY_MAX
+        args += ["-vf", f"scale='min({size},iw)':-2", "-q:v", "2" if self.matte else "3", "-start_number", "0",
                  str(frames / "%06d.jpg")]
         self.track_status.setText("Extracting frames…")
         self.view.set_message(f"Extracting frames from {j.name}…")
-        self.log.line("Extracting frames for roto…")
+        self.log.line(f"Extracting frames for {self.name}…")
         p = QProcess(self)
         p.finished.connect(lambda code, _s: self._extracted(code, p))
         self._extract = p
@@ -689,13 +918,13 @@ class RotoTab(QWidget):
         n_masks = len(list((self.dir / "masks").glob("*.png"))) if (self.dir / "masks").is_dir() else 0
         self.tracked = n_masks == self.nframes and self.nframes > 0
         self._update_track_status()
-        self.track_status.setText(self.track_status.text() + "  Loading SAM 2.1…")
+        self.track_status.setText(self.track_status.text() + "  Loading SAM…")
 
         def opened(r):
             if r.get("ok"):
                 self.worker.session_dir = str(self.dir / "frames")
                 self.log.line(f"Clip ready: {r['frames']} frames at {r['w']}×{r['h']} "
-                              f"(display/roto size).")
+                              f"(working size).")
                 self._update_track_status()
                 if self._has_prompts(self.frame):
                     self._request_prompt_mask()
@@ -729,6 +958,9 @@ class RotoTab(QWidget):
         color = OBJ_COLORS[(int(self.obj) - 1) % len(OBJ_COLORS)]
         live = self.dir / "live" / f"{self.frame:06d}.png"
         tracked = self.dir / "masks" / f"{self.frame:06d}.png"
+        soft = self.dir / "matte" / f"{self.frame:06d}.png"
+        if self.matte and self.edges_used == "matanyone" and soft.exists():
+            tracked = soft  # show the soft matte (hair) once MatAnyone 2 made it
         path = None
         if self._has_prompts(self.frame) and live.exists() and (self.stale or not self.tracked):
             path = live
@@ -741,32 +973,39 @@ class RotoTab(QWidget):
     def _show_marks(self):
         cur = self.prompts.get(self.obj, {}).get(str(self.frame), {})
         pts = list(zip(cur.get("points", []), cur.get("labels", []), strict=False))
-        dim = []
+        dim, dim_regs = [], []
         for oid, frames in self.prompts.items():
             if oid != self.obj:
                 p = frames.get(str(self.frame), {})
                 dim += list(zip(p.get("points", []), p.get("labels", []), strict=False))
-        self.view.set_marks(pts, cur.get("box"), OBJ_COLORS[(int(self.obj) - 1) % len(OBJ_COLORS)], dim)
+                dim_regs += p.get("regions") or []
+        self.view.set_marks(pts, cur.get("box"), OBJ_COLORS[(int(self.obj) - 1) % len(OBJ_COLORS)], dim,
+                            cur.get("regions") or [], dim_regs)
 
     # ================================================================ prompts
 
     def _has_prompts(self, frame: int) -> bool:
         f = str(frame)
-        return any(f in frames and (frames[f].get("points") or frames[f].get("box"))
-                   for frames in self.prompts.values())
+        return any(f in frames and self._used(frames[f]) for frames in self.prompts.values())
+
+    @staticmethod
+    def _used(p: dict) -> bool:
+        return bool(p.get("points") or p.get("box") or p.get("regions"))
 
     def _clean_prompts(self) -> dict:
         out = {}
         for oid, frames in self.prompts.items():
-            keep = {f: p for f, p in frames.items() if p.get("points") or p.get("box")}
+            keep = {f: p for f, p in frames.items() if self._used(p)}
             if keep:
                 out[oid] = keep
         return out
 
     def _entry(self, frame=None) -> dict:
         f = str(self.frame if frame is None else frame)
-        return self.prompts.setdefault(self.obj, {}).setdefault(
-            f, {"points": [], "labels": [], "box": None})
+        e = self.prompts.setdefault(self.obj, {}).setdefault(
+            f, {"points": [], "labels": [], "box": None, "regions": []})
+        e.setdefault("regions", [])  # prompts saved before lassos existed
+        return e
 
     def _snapshot(self):
         e = self._entry()
@@ -788,11 +1027,18 @@ class RotoTab(QWidget):
         self._entry()["box"] = [round(v, 1) for v in (x0, y0, x1, y1)]
         self._prompts_changed()
 
+    def _on_lasso(self, poly, op):
+        if not self._ready_for_prompts():
+            return
+        self._snapshot()
+        self._entry()["regions"].append({"poly": poly, "op": int(op), "exact": self.exact_cb.isChecked()})
+        self._prompts_changed()
+
     def _ready_for_prompts(self) -> bool:
         if self.nframes == 0 or not self.worker.running():
             return False
         if getattr(self.worker, "session_dir", None) != str(self.dir / "frames"):
-            self.log.line("Still loading SAM 2.1, click again in a moment.")
+            self.log.line("Still loading SAM, try again in a moment.")
             return False
         return True
 
@@ -813,12 +1059,12 @@ class RotoTab(QWidget):
         self._prompts_changed()
 
     def _reset_all(self):
-        if QMessageBox.question(self, "Reset", "Remove all clicks and tracked masks for this clip?") \
+        if QMessageBox.question(self, "Reset", "Remove all picks and tracked masks for this clip?") \
                 != QMessageBox.StandardButton.Yes:
             return
         self.prompts, self.undo = {}, []
         self.obj = "1"
-        for sub in ("live", "masks"):
+        for sub in ("live", "masks", "objects", "matte"):
             shutil.rmtree(self.dir / sub, ignore_errors=True)
         self.tracked = self.stale = False
         self._refresh_objects()
@@ -894,38 +1140,62 @@ class RotoTab(QWidget):
     def _update_track_status(self):
         n_prompt = sum(1 for f in range(self.nframes) if self._has_prompts(f)) if self.nframes else 0
         if self.tracked and not self.stale:
-            txt = f"✓ Tracked all {self.nframes} frames. Scrub to check; click on any frame " \
-                  "where it drifts, then Track again."
+            txt = f"✓ Tracked all {self.nframes} frames" + (
+                " with MatAnyone 2 edges" if self.matte and self.edges_used == "matanyone" else "") + \
+                ". Scrub to check; fix any frame where it drifts, then Track again."
         elif self.tracked and self.stale:
-            txt = "Clicks changed since tracking: press Track again."
+            txt = "The selection changed since tracking: press Track again."
         elif n_prompt:
-            txt = f"Clicks on {n_prompt} frame(s). Press Track when the mask looks right."
+            txt = f"Selection on {n_prompt} frame(s). Press Track when the mask looks right."
         else:
-            txt = "Click on the character to start."
+            txt = "Pick what to keep: a point, a box or a lasso."
         self.track_status.setText(txt)
 
     def track(self):
         objs = self._clean_prompts()
         if not objs:
-            QMessageBox.information(self, "Track", "Click on the character first.")
+            QMessageBox.information(self, "Track", "Pick what to keep first.")
             return
         masks = self.dir / "masks"
-        shutil.rmtree(masks, ignore_errors=True)
+        for sub in ("masks", "objects", "matte"):
+            shutil.rmtree(self.dir / sub, ignore_errors=True)
         self.prog.setRange(0, self.nframes)
         self.prog.setValue(0)
         self.track_status.setText("Tracking…")
         self.track_btn.setEnabled(False)
+        soft = self.matte and self.edges.currentData() == "matanyone"
+        if soft and not matanyone_installed(self.s.engine_dir):
+            self.log.line("MatAnyone 2 isn't installed (Setup → Roto models): edges come from SAM.")
+            soft = False
+        anchor = min(int(f) for o in objs.values() for f in o)
 
-        def done(r):
-            self.prog.setValue(self.nframes if r.get("ok") else 0)
-            if r.get("ok"):
+        def finished(ok, edges):
+            self.prog.setValue(self.nframes if ok else 0)
+            if ok:
                 self.tracked, self.stale = True, False
-                self.log.line(f"Tracked {r.get('frames')} frames.")
+                self.edges_used = edges
                 self._save_state()
+                self.refresh_clips()
             self._update_track_status()
             self._show_overlay()
             self._update_enabled()
-        self.worker.send(done, cmd="track", objects=objs, out_dir=str(masks))
+
+        def tracked(r):
+            if not r.get("ok"):
+                finished(False, "")
+                return
+            self.log.line(f"Tracked {r.get('frames')} frames.")
+            if not soft:
+                finished(True, "sam" if self.matte else "")
+                return
+            self.prog.setValue(0)
+            self.track_status.setText("Soft edges with MatAnyone 2 (hair, motion blur)…")
+            self.log.line(f"MatAnyone 2 from frame {anchor + 1}…")
+            self.worker.send(lambda r2: finished(bool(r2.get("ok")), "matanyone" if r2.get("ok") else ""),
+                             cmd="matte", frames_dir=str(self.dir / "frames"), masks_dir=str(masks),
+                             anchor=anchor, out_dir=str(self.dir / "matte"))
+        extra = {"objects_dir": str(self.dir / "objects")} if self.matte else {}
+        self.worker.send(tracked, cmd="track", objects=objs, out_dir=str(masks), **extra)
         self._update_enabled()
 
     def _on_progress(self, i, n):
@@ -1007,7 +1277,7 @@ class RotoTab(QWidget):
 
         def finish(what):
             j.roto_dir = self.dir
-            j.note = "roto"
+            j.note = "hint"
             j.status = "queued" if j.status == "done" else j.status
             self.apply_status.setText(f"✓ {j.name}: {what}. Go to the Key tab and press Key.")
             self.log.line(f"Applied to Key queue: {what}.")
@@ -1019,26 +1289,97 @@ class RotoTab(QWidget):
                          size=list(size), out_dir=str(self.dir / "hint"),
                          grow=self.grow.value(), soften=self.soften.value())
 
+    def export_matte(self):
+        """Roto: full-resolution EXRs (matte / cutout) and Fusion shapes."""
+        if not self.tracked or self.stale:
+            QMessageBox.information(self, "Export", "Track (or re-track) the clip first.")
+            return
+        j, src = self.job, self._source(self.job)
+        size = self._full_size()
+        if not size[0]:
+            QMessageBox.warning(self, "Export", f"Can't read {src}.")
+            return
+        want_img = self.exp_alpha.isChecked() or self.exp_cutout.isChecked()
+        if not (want_img or self.exp_shapes.isChecked()):
+            QMessageBox.information(self, "Export", "Tick at least one thing to export.")
+            return
+        out = Path(self.out_edit.text().strip()) if self.out_edit.text().strip() \
+            else j.source.parent / f"{j.name}_roto_export"
+        alpha_dir = self.dir / ("matte" if self.edges_used == "matanyone" else "masks")
+        self._save_state()
+        self.apply_btn.setEnabled(False)
+        self.prog.setRange(0, self.nframes)
+        self.prog.setValue(0)
+        made = []
+
+        def fail(what, r):
+            self.apply_status.setText(f"{what} failed: {r.get('error', 'see the log')}")
+            self._update_enabled()
+
+        def shapes():
+            if not self.exp_shapes.isChecked():
+                return finish()
+            self.apply_status.setText("Writing shapes for Fusion…")
+            dest = out / f"{j.name}_shapes.setting"
+
+            def done(r):
+                if not r.get("ok"):
+                    return fail("Shapes", r)
+                made.append(f"shapes ({r.get('keyframes')} keyframes)")
+                finish()
+            self.worker.send(done, cmd="shapes", objects_dir=str(self.dir / "objects"),
+                             size=list(size), out=str(dest))
+
+        def images_done(r):
+            if not r.get("ok"):
+                return fail("Export", r)
+            made.append(f"{r.get('frames')} frames")
+            shapes()
+
+        def finish():
+            self.prog.setValue(self.nframes)
+            self.apply_status.setText(f"✓ {j.name}: {', '.join(made)} in {out}")
+            self.log.line(f"Exported to {out}: {', '.join(made)}.")
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(out)))
+            self._update_enabled()
+
+        out.mkdir(parents=True, exist_ok=True)
+        if want_img:
+            self.apply_status.setText("Writing EXRs at full resolution…")
+            self.worker.send(images_done, cmd="export_matte", alpha_dir=str(alpha_dir), src=str(src),
+                             kind=j.kind, out_dir=str(out), name=j.name,
+                             alpha=self.exp_alpha.isChecked(), cutout=self.exp_cutout.isChecked())
+        else:
+            shapes()
+
     # ================================================================ state
 
     def _state_file(self) -> Path | None:
         return self.dir / "roto.json" if self.dir else None
 
     def _save_state(self):
-        for k, sl in (("grow", self.grow), ("soften", self.soften), ("margin", self.margin),
-                      ("feather", self.feather)):
-            self.s.set(f"roto/{k}", sl.value())
-        self.s.set("roto/garbage", self.garbage_on.isChecked())
+        if self.matte:
+            self.s.set(f"{self.ns}/edges", self.edges.currentData())
+            self.s.set(f"{self.ns}/out_dir", self.out_edit.text().strip())
+            for cb, k in ((self.exp_alpha, "alpha"), (self.exp_cutout, "cutout"), (self.exp_shapes, "shapes")):
+                self.s.set(f"{self.ns}/exp_{k}", cb.isChecked())
+        else:
+            for k, sl in (("grow", self.grow), ("soften", self.soften), ("margin", self.margin),
+                          ("feather", self.feather)):
+                self.s.set(f"roto/{k}", sl.value())
+            self.s.set("roto/garbage", self.garbage_on.isChecked())
         f = self._state_file()
         if not f:
             return
         f.write_text(json.dumps({"prompts": self._clean_prompts(), "obj": self.obj,
                                  "tracked": self.tracked, "stale": self.stale,
+                                 "edges": self.edges_used,
                                  "model": self.model_combo.currentData()}, indent=1))
 
     def _load_state(self):
         self.prompts, self.undo, self.obj, self.frame = {}, [], "1", 0
         self.tracked = self.stale = False
+        self.edges_used = ""
         f = self._state_file()
         if f and f.exists():
             try:
@@ -1046,9 +1387,10 @@ class RotoTab(QWidget):
                 self.prompts = st.get("prompts", {})
                 self.obj = st.get("obj", "1")
                 self.stale = bool(st.get("stale"))
+                self.edges_used = st.get("edges", "")
                 first = sorted(int(fr) for o in self.prompts.values() for fr in o)
                 self.frame = first[0] if first else 0
-                self.log.line(f"Restored roto clicks from {f.name}.")
+                self.log.line(f"Restored the selection from {f.name}.")
             except (OSError, ValueError):
                 pass
 

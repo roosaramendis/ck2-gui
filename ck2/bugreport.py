@@ -8,6 +8,7 @@ import html
 import os
 import platform
 import shutil
+import re
 import subprocess
 import sys
 import urllib.parse
@@ -107,12 +108,18 @@ def build_zip(settings, logs: dict[str, str], text: str) -> Path:
             if content.strip():
                 z.writestr(f"app-logs/{name}.log", content)
         pc = plugin_cache_dir()
-        for f in [pc / "plugin.log", pc / "roto" / "daemon.log", plugin_conf()]:
+        for f, name in [(pc / "plugin.log", "plugin.log"), (pc / "roto" / "daemon.log", "hint-daemon.log"),
+                        (pc / "rotomatte" / "daemon.log", "roto-daemon.log"), (plugin_conf(), "ofx.conf")]:
             if f.is_file():
-                z.writestr(f"plugin/{f.name}", _tail(f, 3000))
-        # the newest few plugin jobs (key + roto): their engine/picker logs
-        jobs = sorted([p for p in pc.glob("*/engine.log")] + [p for p in pc.glob("roto/*/engine.log")]
-                      + [p for p in pc.glob("roto/*/picker.log")], key=lambda p: p.stat().st_mtime)[-6:]
+                text_ = _tail(f, 3000)
+                if name == "ofx.conf":  # never send the Hugging Face token
+                    text_ = re.sub(r"(?m)^(\s*hf_token\s*=).*$", r"\1<removed>", text_)
+                z.writestr(f"plugin/{name}", text_)
+        # the newest few plugin jobs (key, hint, roto): their engine/picker logs
+        jobs = sorted([p for p in pc.glob("*/engine.log")]
+                      + [p for d in ("roto", "rotomatte") for p in pc.glob(f"{d}/*/engine.log")]
+                      + [p for d in ("roto", "rotomatte") for p in pc.glob(f"{d}/*/picker.log")],
+                      key=lambda p: p.stat().st_mtime)[-6:]
         for f in jobs:
             z.writestr(f"plugin/jobs/{f.parent.name}-{f.name}", _tail(f, 2000))
         for f in sorted(tools.log_dir().glob("*.log"))[-5:]:
